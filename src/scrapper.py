@@ -1,181 +1,339 @@
-# Credits to the orignal author: https://github.com/Aniell4/MassDN/blob/main/scrape.py
+# Credits to the original author: https://github.com/Aniell4/MassDN/blob/main/scrape.py
+# Scraping logic ported from the Go implementation at github.com/shahzain345/raidx (private)
+# For more info about lazy guilds check out: https://luna.gitlab.io/discord-unofficial-docs/docs/lazy_guilds
 import websocket
 import json
 import threading
 import time
+from ._utility import MPrint
 from .global_variables import *
 
+console = MPrint()
 
-class Utils:
-    def rangeCorrector(ranges):
-        if [0, 99] not in ranges:
-            ranges.insert(0, [0, 99])
-        return ranges
+GATEWAY_URL = "wss://gateway.discord.gg/?encoding=json&v=9"
 
-    def getRanges(index, multiplier, memberCount):
-        initialNum = int(index*multiplier)
-        rangesList = [[initialNum, initialNum+99]]
-        if memberCount > initialNum+99:
-            rangesList.append([initialNum+100, initialNum+199])
-        return Utils.rangeCorrector(rangesList)
-
-    def parseGuildMemberListUpdate(response):
-        memberdata = {
-            "online_count": response["d"]["online_count"],
-            "member_count": response["d"]["member_count"],
-            "id": response["d"]["id"],
-            "guild_id": response["d"]["guild_id"],
-            "hoisted_roles": response["d"]["groups"],
-            "types": [],
-            "locations": [],
-            "updates": []
-        }
-
-        for chunk in response['d']['ops']:
-            memberdata['types'].append(chunk['op'])
-            if chunk['op'] in ('SYNC', 'INVALIDATE'):
-                memberdata['locations'].append(chunk['range'])
-                if chunk['op'] == 'SYNC':
-                    memberdata['updates'].append(chunk['items'])
-                else:  # invalidate
-                    memberdata['updates'].append([])
-            elif chunk['op'] in ('INSERT', 'UPDATE', 'DELETE'):
-                memberdata['locations'].append(chunk['index'])
-                if chunk['op'] == 'DELETE':
-                    memberdata['updates'].append([])
-                else:
-                    memberdata['updates'].append(chunk['item'])
-
-        return memberdata
+SOCKET_HEADERS = [
+    "Accept-Encoding: gzip, deflate, br",
+    "Accept-Language: en-US,en;q=0.9",
+    "Cache-Control: no-cache",
+    "Pragma: no-cache",
+    "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
+    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.2 Safari/605.1.15",
+]
 
 
-class DiscordSocket(websocket.WebSocketApp):
-    def __init__(self, token, guild_id, channel_id):
+class LazyGuildScraper:
+    """
+    Discord lazy guild member scraper (OP 14 / GUILD_MEMBER_LIST_UPDATE).
+
+    Ported from the Go `LazyGuildScraper`. Adds deduplication, auto-reconnect,
+    member-count-aware ranges and adaptive range-jumping when scraping stalls.
+    """
+
+    def __init__(self, token: str, guild_id: str, channel_id: str):
         self.token = token
         self.guild_id = guild_id
         self.channel_id = channel_id
 
-        self.socket_headers = {
-            "Accept-Encoding": "gzip, deflate, br",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.2 Safari/605.1.15"
-        }
-
-        super().__init__("wss://gateway.discord.gg/?encoding=json&v=9",
-                         header=self.socket_headers,
-                         on_open=lambda ws: self.sock_open(ws),
-                         on_message=lambda ws, msg: self.sock_message(ws, msg),
-                         on_close=lambda ws, close_code, close_msg: self.sock_close(
-                             ws, close_code, close_msg)
-                         )
-
-        self.endScraping = False
-
-        self.guilds = {}
+        # members doubles as the dedup map: id -> {"tag", "id", "nick"}
         self.members = {}
+        self.ranges = [[0, 99]]  # start with the first 100 members
+        self.last_range_idx = 0
+        self.member_count = 0
+        self.range_counter = 0
+        self.max_ranges = 200
+        self.last_seq = None
 
-        self.ranges = [[0, 0]]
-        self.lastRange = 0
-        self.packets_recv = 0
+        self.reconnects = 0
+        self.max_reconnects = 3
 
-    def run(self):
-        self.run_forever()
-        return self.members
+        self.ws = None
+        self._lock = threading.Lock()
+        self._done = threading.Event()   # set when scraping is finished/exhausted
+        self._stop = threading.Event()   # set to tear down worker threads
 
-    def scrapeUsers(self):
-        if self.endScraping == False:
-            self.send('{"op":14,"d":{"guild_id":"' + self.guild_id +
-                      '","typing":true,"activities":true,"threads":true,"channels":{"' + self.channel_id + '":' + json.dumps(self.ranges) + '}}}')
+    # ---- connection -------------------------------------------------------
+    def connect(self):
+        """Open the gateway, read HELLO and send IDENTIFY. Returns the heartbeat interval (seconds)."""
+        self.ws = websocket.create_connection(
+            GATEWAY_URL, header=SOCKET_HEADERS, enable_multithread=True)
 
-    def sock_open(self, ws):
-        #print("[Gateway]", "Connected to WebSocket.")
-        self.send('{"op":2,"d":{"token":"' + self.token + '","capabilities":125,"properties":{"os":"Windows","browser":"Firefox","device":"","system_locale":"it-IT","browser_user_agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0","browser_version":"94.0","os_version":"10","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":103981,"client_event_source":null},"presence":{"status":"online","since":0,"activities":[],"afk":false},"compress":false,"client_state":{"guild_hashes":{},"highest_last_message_id":"0","read_state_version":0,"user_guild_settings_version":-1,"user_settings_version":-1}}}')
+        hello = json.loads(self.ws.recv())
+        heartbeat_interval = hello["d"]["heartbeat_interval"] / 1000
 
-    def heartbeatThread(self, interval):
-        try:
-            while True:
-                #print("sending heartbeat")
-                self.send('{"op":1,"d":' + str(self.packets_recv) + '}')
-                time.sleep(interval)
-        except Exception as e:
-            pass  # print(e)
-            return  # returns when socket is closed
+        identify = {
+            "op": 2,
+            "d": {
+                "token": self.token,
+                "capabilities": 125,
+                "properties": {
+                    "os": "Windows", "browser": "Firefox", "device": "",
+                    "system_locale": "it-IT",
+                    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
+                    "browser_version": "94.0", "os_version": "10",
+                    "referrer": "", "referring_domain": "",
+                    "referrer_current": "", "referring_domain_current": "",
+                    "release_channel": "stable", "client_build_number": 103981,
+                    "client_event_source": None,
+                },
+                "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
+                "compress": False,
+                "client_state": {
+                    "guild_hashes": {}, "highest_last_message_id": "0",
+                    "read_state_version": 0, "user_guild_settings_version": -1,
+                    "user_settings_version": -1,
+                },
+            },
+        }
+        self.ws.send(json.dumps(identify))
+        return heartbeat_interval
 
-    def sock_message(self, ws, message):
-        decoded = json.loads(message)
-        ids_scraped = len(self.members)
+    # ---- requests ---------------------------------------------------------
+    def send_lazy_request(self):
+        """Send an OP 14 request for the current ranges."""
+        with self._lock:
+            ranges = [list(r) for r in self.ranges]
+        payload = {
+            "op": 14,
+            "d": {
+                "guild_id": self.guild_id,
+                "typing": True,
+                "threads": False,
+                "activities": True,
+                "members": [],
+                "channels": {self.channel_id: ranges},
+            },
+        }
+        self.ws.send(json.dumps(payload))
 
-        if decoded is None:
-            return
+    def get_ranges(self, index: int, multiplier: int):
+        """Generate the next ranges, always keeping [0, 99] present (mirrors the Go GetRanges)."""
+        initial = int(index * multiplier)
+        ranges = [[initial, initial + 99]]
+        if self.member_count > initial + 99:
+            ranges.append([initial + 100, initial + 199])
+        if [0, 99] not in ranges:
+            ranges.insert(0, [0, 99])
+        return ranges
 
-        if decoded["op"] != 11:
-            self.packets_recv += 1
+    def request_next_range(self):
+        """Advance to and request the next range. Raises RuntimeError once max_ranges is hit."""
+        with self._lock:
+            if self.range_counter >= self.max_ranges:
+                raise RuntimeError(
+                    f"reached maximum number of range requests ({self.max_ranges})")
+            self.last_range_idx += 1
+            self.ranges = self.get_ranges(self.last_range_idx, 100)
+            self.range_counter += 1
+        self.send_lazy_request()
 
-        if decoded["op"] == 10:
-            threading.Thread(target=self.heartbeatThread, args=(
-                decoded["d"]["heartbeat_interval"] / 1000, ), daemon=True).start()
+    # ---- member handling --------------------------------------------------
+    def add_member(self, user: dict, nick=None) -> bool:
+        """Add a member if not already seen. Returns True if it was new."""
+        uid = user.get("id")
+        if not uid:
+            return False
+        with self._lock:
+            if uid in self.members:
+                return False
+            tag = user.get("username", "")
+            discrim = user.get("discriminator")
+            if discrim and discrim != "0":
+                tag = f"{tag}#{discrim}"
+            self.members[uid] = {"tag": tag, "id": uid, "nick": nick}
+        return True
 
-        if decoded["t"] == "READY":
-            for guild in decoded["d"]["guilds"]:
-                self.guilds[guild["id"]] = {
-                    "member_count": guild["member_count"]}
+    def process_member_list_update(self, decoded: dict) -> int:
+        """Process a GUILD_MEMBER_LIST_UPDATE event. Returns the number of newly added members."""
+        d = decoded.get("d", {})
+        if d.get("guild_id") != self.guild_id:
+            return 0
 
-        if decoded["t"] == "READY_SUPPLEMENTAL":
-            self.ranges = Utils.getRanges(
-                0, 100, self.guilds[self.guild_id]["member_count"])
-            # print(self.ranges)
-            self.scrapeUsers()
+        if d.get("member_count", 0) > 0:
+            with self._lock:
+                self.member_count = d["member_count"]
 
-        elif decoded["t"] == "GUILD_MEMBER_LIST_UPDATE":
-            parsed = Utils.parseGuildMemberListUpdate(decoded)
+        added = 0
+        for op in d.get("ops", []):
+            if op.get("op") != "SYNC":
+                continue
+            items = op.get("items", [])
+            if not items:
+                # empty SYNC -> likely reached the end of the available members for this range
+                continue
+            for item in items:
+                member = item.get("member") if isinstance(item, dict) else None
+                if member and member.get("user", {}).get("id"):
+                    if self.add_member(member["user"], member.get("nick")):
+                        added += 1
+        return added
 
-            if parsed['guild_id'] == self.guild_id and ('SYNC' in parsed['types'] or 'UPDATE' in parsed['types']):
-                for elem, index in enumerate(parsed["types"]):
-                    if index == "SYNC":
-                        # and parsed['locations'][elem] in self.ranges[1:]: #checks if theres nothing in the SYNC data
-                        if len(parsed['updates'][elem]) == 0:
-                            self.endScraping = True
-                            break
+    # ---- worker loops -----------------------------------------------------
+    def heartbeat(self, interval: float):
+        """Send heartbeats until told to stop. Reads self.ws each tick so it survives reconnects."""
+        while not self._stop.wait(interval):
+            try:
+                self.ws.send(json.dumps({"op": 1, "d": self.last_seq}))
+            except Exception:
+                return
 
-                        for item in parsed["updates"][elem]:
-                            if "member" in item:
-                                mem = item["member"]
-                                obj = {"tag": mem["user"]["username"] + "#" +
-                                       mem["user"]["discriminator"], "id": mem["user"]["id"]}
+    def listen(self):
+        """Read and dispatch gateway messages, reconnecting on abnormal closure."""
+        while not self._stop.is_set():
+            try:
+                raw = self.ws.recv()
+            except Exception as e:
+                if self._stop.is_set():
+                    return
+                if self.reconnects < self.max_reconnects:
+                    self.reconnects += 1
+                    console.w_print(
+                        f"Discord closed connection: {e} - attempting to reconnect ({self.reconnects}/{self.max_reconnects})...")
+                    # Reset to the first range to avoid replaying problematic ranges.
+                    with self._lock:
+                        if len(self.ranges) > 1:
+                            self.ranges = self.ranges[:1]
+                    try:
+                        self.connect()
+                        console.s_print("Successfully reconnected to Discord")
+                        continue
+                    except Exception as re:
+                        console.f_print(f"Failed to reconnect: {re}")
+                        self._done.set()
+                        return
+                console.f_print(f"Error reading message: {e}")
+                self._done.set()
+                return
 
-                                self.members[mem["user"]["id"]] = obj
-                                #print("<SYNC>", "synced", mem["user"]["id"])
+            if not raw:
+                continue
+            try:
+                decoded = json.loads(raw)
+            except Exception as e:
+                console.w_print(f"Error parsing message: {e}")
+                continue
+            if decoded is None:
+                continue
 
-                    elif index == "UPDATE":
-                        for item in parsed["updates"][elem]:
-                            if "member" in item:
-                                mem = item["member"]
-                                obj = {"tag": mem["user"]["username"] + "#" +
-                                       mem["user"]["discriminator"], "id": mem["user"]["id"]}
+            if decoded.get("s") is not None:
+                self.last_seq = decoded["s"]
 
-                                self.members[mem["user"]["id"]] = obj
-                                # print("<SYNC>", "synced", mem["user"]["id"]) # ah 1s
+            op = decoded.get("op")
+            if op == 0:  # Dispatch
+                t = decoded.get("t")
+                if t == "READY":
+                    # Capture this guild's member count so ranges know when to stop.
+                    for g in decoded["d"].get("guilds", []):
+                        if g.get("id") == self.guild_id:
+                            self.member_count = g.get("member_count", 0)
+                elif t == "READY_SUPPLEMENTAL":
+                    console.s_print("Connection ready, sending lazy request")
+                    with self._lock:
+                        self.ranges = self.get_ranges(0, 100)
+                    try:
+                        self.send_lazy_request()
+                    except Exception as e:
+                        console.f_print(f"Error sending lazy request: {e}")
+                        self._done.set()
+                        return
+                elif t == "GUILD_MEMBER_LIST_UPDATE":
+                    added = self.process_member_list_update(decoded)
+                    if added > 0:
+                        console.s_print(
+                            f"Added {added} new unique members (total: {len(self.members)})")
+            # op 10 (Hello) is consumed in connect(); op 11 (Heartbeat ACK) needs no action.
 
-                    # print(self.endScraping)
-                    # print(self.ranges)
-                    #print("parsed", len(self.members))
+    def range_loop(self):
+        """Drive range requests, jumping to new positions when scraping stalls (mirrors the Go goroutine)."""
+        # Give READY_SUPPLEMENTAL / the initial sync time to land before requesting more.
+        time.sleep(3)
 
-                    self.lastRange += 1
-                    self.ranges = Utils.getRanges(
-                        self.lastRange, 100, self.guilds[self.guild_id]["member_count"])
-                    time.sleep(0.35)
-                    self.scrapeUsers()
+        consecutive_no_new = 0
+        last_count = 0
+        restart_attempts = 0
+        max_restart_attempts = 3
 
-            if self.endScraping:
-                self.close()
+        # 350ms cadence, matching the Python/Go reference implementations.
+        while not self._stop.wait(0.35):
+            with self._lock:
+                count = len(self.members)
+            if count == 0:
+                continue
 
-    def sock_close(self, ws, close_code, close_msg):
-        pass 
+            if count > last_count:
+                console.s_print(
+                    f"Currently scraped {count} unique members, requesting next range...")
+                consecutive_no_new = 0
+            else:
+                consecutive_no_new += 1
+                console.w_print(
+                    f"No new members since last request ({consecutive_no_new} consecutive empty results)")
+
+                # Stuck for a while: jump to a different position to find more members.
+                if consecutive_no_new >= 5 and restart_attempts < max_restart_attempts:
+                    restart_attempts += 1
+                    consecutive_no_new = 0
+                    jump_multiplier = 200 * restart_attempts if count < 500 else 1000 * restart_attempts
+                    with self._lock:
+                        self.last_range_idx = jump_multiplier // 100
+                        self.ranges = self.get_ranges(self.last_range_idx, 100)
+                    console.s_print(
+                        f"Restarting at range index {self.last_range_idx} to find more members "
+                        f"(attempt {restart_attempts}/{max_restart_attempts})")
+
+                # Exhausted the restarts and still nothing new: we're done.
+                if consecutive_no_new >= 5 and restart_attempts >= max_restart_attempts:
+                    console.s_print(
+                        f"No new members found after {max_restart_attempts} restart attempts, stopping scraper")
+                    self._done.set()
+                    return
+
+            last_count = count
+
+            try:
+                self.request_next_range()
+            except RuntimeError as e:
+                console.w_print(f"Error requesting next range: {e}")
+                console.s_print("Reached maximum range requests, saving results")
+                self._done.set()
+                return
+            except Exception as e:
+                console.w_print(f"Error requesting next range: {e}")
+                with self._lock:
+                    self.last_range_idx += 1
 
 
 def scrape(token: str, guild_id: str, channel_id: str):
-    sb = DiscordSocket(token, guild_id, channel_id)
-    return sb.run()
+    """
+    Scrape unique members of a guild and return them as a dict keyed by user id
+    ({id: {"tag", "id", "nick"}}). Iterating the result yields the member ids,
+    matching what main.py expects.
+    """
+    scraper = LazyGuildScraper(token, guild_id, channel_id)
+
+    console.s_print("Connecting to Discord gateway...")
+    try:
+        interval = scraper.connect()
+    except Exception as e:
+        console.f_print(f"Failed to connect: {e}")
+        return scraper.members
+    console.s_print("Connected to Discord gateway")
+
+    threading.Thread(target=scraper.heartbeat, args=(interval,), daemon=True).start()
+    threading.Thread(target=scraper.listen, daemon=True).start()
+    threading.Thread(target=scraper.range_loop, daemon=True).start()
+
+    # Wait until a worker signals completion, with a 30-minute safety timeout.
+    scraper._done.wait(timeout=1800)
+    if not scraper._done.is_set():
+        console.w_print("Maximum scraping time reached (30 minutes)")
+
+    scraper._stop.set()
+    try:
+        if scraper.ws:
+            scraper.ws.close()
+    except Exception:
+        pass
+
+    console.s_print(f"Scraping completed. Total unique members: {len(scraper.members)}")
+    return scraper.members

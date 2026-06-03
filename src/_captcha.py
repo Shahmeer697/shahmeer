@@ -1,12 +1,12 @@
 import twocaptcha
-import httpx
+import httpz
 from ._utility import Utility, MPrint
 console = MPrint()
 
 
 class Captcha:
     def __init__(self):
-        self._client = httpx.AsyncClient()
+        self._client = httpz.AsyncClient()
         self._utils = Utility()
         self.api = self._utils.config["captcha"]["api"]
         self.key = self._utils.config["captcha"]["key"]
@@ -15,7 +15,7 @@ class Captcha:
             captcha = twocaptcha.TwoCaptcha(self.key)
             return captcha.balance()
         elif self.api == "anti-captcha.com" or self.api == "capmonster.cloud":
-            resp = httpx.post(f"https://api.{self.api}/getBalance", json={"clientKey": self.key}).json()
+            resp = httpz.post(f"https://api.{self.api}/getBalance", json={"clientKey": self.key}).json()
             if resp.get("errorId") > 0:
                 console.f_print(f"Error while getting captcha balance: {resp.get('errorDescription')}")
                 return 0.0

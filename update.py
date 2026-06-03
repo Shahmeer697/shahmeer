@@ -2,7 +2,7 @@
 # This file will look for updates and if there is any it will automatically install it.
 # Please avoid changing anything in this file.
 from colorama import Fore, Style
-import httpx
+import httpz
 from src import getVersion
 APP_VERSION = getVersion()
 APP_NAME = "Discord MultiTool V2"
@@ -11,7 +11,7 @@ BASE_URL = "http://localhost:3001"
 
 
 def lookforupdates():
-    req = httpx.post(f"{BASE_URL}/api/v2/update", json={
+    req = httpz.post(f"{BASE_URL}/api/v2/update", json={
         "v": APP_VERSION
     }, timeout=30).json()
     if req["current"] == True:
@@ -31,7 +31,7 @@ def lookforupdates():
                 f"Do you wish to install MultiTool Version: {CURRENT_VERSION}? This will reset all your configuration files (y/n). \n>> ").lower()
             if choice != "y":
                 return None
-            client = httpx.Client()
+            client = httpz.Client()
             req = client.get(
                 "https://raw.githubusercontent.com/shahzain345/Discord-MultiToolPY/main/main.py")
             open("main.py", 'w', encoding="utf-8").write(req.text)

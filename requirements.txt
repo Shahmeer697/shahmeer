@@ -1,4 +1,4 @@
-httpx
+pyhttpz
 2captcha-python
 tasksio
 colorama

@@ -5,7 +5,7 @@ import websocket
 import json
 import threading
 import time
-from ._utility import MPrint
+from ._utility import MPrint, USER_AGENT, gatewayProperties
 from .global_variables import *
 
 console = MPrint()
@@ -18,7 +18,7 @@ SOCKET_HEADERS = [
     "Cache-Control: no-cache",
     "Pragma: no-cache",
     "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits",
-    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.2 Safari/605.1.15",
+    f"User-Agent: {USER_AGENT}",
 ]
 
 
@@ -30,12 +30,14 @@ class LazyGuildScraper:
     member-count-aware ranges and adaptive range-jumping when scraping stalls.
     """
 
-    def __init__(self, token: str, guild_id: str, channel_id: str):
+    def __init__(self, token: str, guild_id: str, channel_id: str, scrape_field: str = "id"):
+        if ":" in token:
+            token = token.split(":")[-1]
         self.token = token
         self.guild_id = guild_id
         self.channel_id = channel_id
+        self.scrape_field = scrape_field
 
-        # members doubles as the dedup map: id -> {"tag", "id", "nick"}
         self.members = {}
         self.ranges = [[0, 99]]  # start with the first 100 members
         self.last_range_idx = 0
@@ -49,14 +51,15 @@ class LazyGuildScraper:
 
         self.ws = None
         self._lock = threading.Lock()
-        self._done = threading.Event()   # set when scraping is finished/exhausted
-        self._stop = threading.Event()   # set to tear down worker threads
+        self._done = threading.Event()  # set when scraping is finished/exhausted
+        self._stop = threading.Event()  # set to tear down worker threads
 
     # ---- connection -------------------------------------------------------
     def connect(self):
         """Open the gateway, read HELLO and send IDENTIFY. Returns the heartbeat interval (seconds)."""
         self.ws = websocket.create_connection(
-            GATEWAY_URL, header=SOCKET_HEADERS, enable_multithread=True)
+            GATEWAY_URL, header=SOCKET_HEADERS, enable_multithread=True
+        )
 
         hello = json.loads(self.ws.recv())
         heartbeat_interval = hello["d"]["heartbeat_interval"] / 1000
@@ -66,21 +69,19 @@ class LazyGuildScraper:
             "d": {
                 "token": self.token,
                 "capabilities": 125,
-                "properties": {
-                    "os": "Windows", "browser": "Firefox", "device": "",
-                    "system_locale": "it-IT",
-                    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
-                    "browser_version": "94.0", "os_version": "10",
-                    "referrer": "", "referring_domain": "",
-                    "referrer_current": "", "referring_domain_current": "",
-                    "release_channel": "stable", "client_build_number": 103981,
-                    "client_event_source": None,
+                "properties": gatewayProperties(),
+                "presence": {
+                    "status": "online",
+                    "since": 0,
+                    "activities": [],
+                    "afk": False,
                 },
-                "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
                 "compress": False,
                 "client_state": {
-                    "guild_hashes": {}, "highest_last_message_id": "0",
-                    "read_state_version": 0, "user_guild_settings_version": -1,
+                    "guild_hashes": {},
+                    "highest_last_message_id": "0",
+                    "read_state_version": 0,
+                    "user_guild_settings_version": -1,
                     "user_settings_version": -1,
                 },
             },
@@ -121,7 +122,8 @@ class LazyGuildScraper:
         with self._lock:
             if self.range_counter >= self.max_ranges:
                 raise RuntimeError(
-                    f"reached maximum number of range requests ({self.max_ranges})")
+                    f"reached maximum number of range requests ({self.max_ranges})"
+                )
             self.last_range_idx += 1
             self.ranges = self.get_ranges(self.last_range_idx, 100)
             self.range_counter += 1
@@ -130,7 +132,14 @@ class LazyGuildScraper:
     # ---- member handling --------------------------------------------------
     def add_member(self, user: dict, nick=None) -> bool:
         """Add a member if not already seen. Returns True if it was new."""
-        uid = user.get("id")
+        if self.scrape_field == "avatar":
+            user_id = user.get("id")
+            avatar = user.get("avatar")
+            if not user_id or not avatar:
+                return False
+            uid = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.webp"
+        else:
+            uid = user.get(self.scrape_field)
         if not uid:
             return False
         with self._lock:
@@ -159,11 +168,10 @@ class LazyGuildScraper:
                 continue
             items = op.get("items", [])
             if not items:
-                # empty SYNC -> likely reached the end of the available members for this range
                 continue
             for item in items:
                 member = item.get("member") if isinstance(item, dict) else None
-                if member and member.get("user", {}).get("id"):
+                if member and member.get("user", {}).get(self.scrape_field):
                     if self.add_member(member["user"], member.get("nick")):
                         added += 1
         return added
@@ -188,8 +196,8 @@ class LazyGuildScraper:
                 if self.reconnects < self.max_reconnects:
                     self.reconnects += 1
                     console.w_print(
-                        f"Discord closed connection: {e} - attempting to reconnect ({self.reconnects}/{self.max_reconnects})...")
-                    # Reset to the first range to avoid replaying problematic ranges.
+                        f"Discord closed connection: {e} - attempting to reconnect ({self.reconnects}/{self.max_reconnects})..."
+                    )
                     with self._lock:
                         if len(self.ranges) > 1:
                             self.ranges = self.ranges[:1]
@@ -222,7 +230,6 @@ class LazyGuildScraper:
             if op == 0:  # Dispatch
                 t = decoded.get("t")
                 if t == "READY":
-                    # Capture this guild's member count so ranges know when to stop.
                     for g in decoded["d"].get("guilds", []):
                         if g.get("id") == self.guild_id:
                             self.member_count = g.get("member_count", 0)
@@ -240,12 +247,11 @@ class LazyGuildScraper:
                     added = self.process_member_list_update(decoded)
                     if added > 0:
                         console.s_print(
-                            f"Added {added} new unique members (total: {len(self.members)})")
-            # op 10 (Hello) is consumed in connect(); op 11 (Heartbeat ACK) needs no action.
+                            f"Added {added} new unique members (total: {len(self.members)})"
+                        )
 
     def range_loop(self):
         """Drive range requests, jumping to new positions when scraping stalls (mirrors the Go goroutine)."""
-        # Give READY_SUPPLEMENTAL / the initial sync time to land before requesting more.
         time.sleep(3)
 
         consecutive_no_new = 0
@@ -253,7 +259,6 @@ class LazyGuildScraper:
         restart_attempts = 0
         max_restart_attempts = 3
 
-        # 350ms cadence, matching the Python/Go reference implementations.
         while not self._stop.wait(0.35):
             with self._lock:
                 count = len(self.members)
@@ -262,29 +267,35 @@ class LazyGuildScraper:
 
             if count > last_count:
                 console.s_print(
-                    f"Currently scraped {count} unique members, requesting next range...")
+                    f"Currently scraped {count} unique members, requesting next range..."
+                )
                 consecutive_no_new = 0
             else:
                 consecutive_no_new += 1
                 console.w_print(
-                    f"No new members since last request ({consecutive_no_new} consecutive empty results)")
+                    f"No new members since last request ({consecutive_no_new} consecutive empty results)"
+                )
 
-                # Stuck for a while: jump to a different position to find more members.
                 if consecutive_no_new >= 5 and restart_attempts < max_restart_attempts:
                     restart_attempts += 1
                     consecutive_no_new = 0
-                    jump_multiplier = 200 * restart_attempts if count < 500 else 1000 * restart_attempts
+                    jump_multiplier = (
+                        200 * restart_attempts
+                        if count < 500
+                        else 1000 * restart_attempts
+                    )
                     with self._lock:
                         self.last_range_idx = jump_multiplier // 100
                         self.ranges = self.get_ranges(self.last_range_idx, 100)
                     console.s_print(
                         f"Restarting at range index {self.last_range_idx} to find more members "
-                        f"(attempt {restart_attempts}/{max_restart_attempts})")
+                        f"(attempt {restart_attempts}/{max_restart_attempts})"
+                    )
 
-                # Exhausted the restarts and still nothing new: we're done.
                 if consecutive_no_new >= 5 and restart_attempts >= max_restart_attempts:
                     console.s_print(
-                        f"No new members found after {max_restart_attempts} restart attempts, stopping scraper")
+                        f"No new members found after {max_restart_attempts} restart attempts, stopping scraper"
+                    )
                     self._done.set()
                     return
 
@@ -303,13 +314,14 @@ class LazyGuildScraper:
                     self.last_range_idx += 1
 
 
-def scrape(token: str, guild_id: str, channel_id: str):
+def scrape(token: str, guild_id: str, channel_id: str, scrape_field: str = "id"):
     """
-    Scrape unique members of a guild and return them as a dict keyed by user id
-    ({id: {"tag", "id", "nick"}}). Iterating the result yields the member ids,
-    matching what main.py expects.
+    Scrape unique members of a guild and return them as a dict keyed by the
+    chosen field ({value: {"tag", "id", "nick"}}). Iterating the result yields
+    the keys, matching what main.py expects. scrape_field defaults to "id";
+    pass "global_name" to scrape global names instead.
     """
-    scraper = LazyGuildScraper(token, guild_id, channel_id)
+    scraper = LazyGuildScraper(token, guild_id, channel_id, scrape_field)
 
     console.s_print("Connecting to Discord gateway...")
     try:
@@ -323,7 +335,6 @@ def scrape(token: str, guild_id: str, channel_id: str):
     threading.Thread(target=scraper.listen, daemon=True).start()
     threading.Thread(target=scraper.range_loop, daemon=True).start()
 
-    # Wait until a worker signals completion, with a 30-minute safety timeout.
     scraper._done.wait(timeout=1800)
     if not scraper._done.is_set():
         console.w_print("Maximum scraping time reached (30 minutes)")

@@ -4,14 +4,17 @@
         "proxyless": true
     },
     "captcha": {
-        "api": "anti-captcha.com",
+        "api": "flanker.wtf",
         "key": "YOUR CAPTCHA KEY"
     },
     "joiner": {
-        "useDelays": false,
-        "delay": 10,
+        "useDelays": true,
+        "delay": 15,
         "bypassMembershipScreening": true,
-        "bypassReactionVerification": false
+        "bypassOnboarding": true,
+        "bypassButtonAndEmojiVerification": true,
+        "bypassDoubleCounter": false,
+        "scrapperApiKey": "YOUR SCRAPPEY KEY"
     },
     "removeDeadTokens": true,
     "preferedThreads": 100000,

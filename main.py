@@ -21,7 +21,6 @@ from traceback import format_exc
 from typing import Union
 from colorama import Fore, Style
 from tasksio import TaskPool
-from multiprocessing.pool import ThreadPool
 # VARIABLES
 console = MPrint()
 goodtokens = []
@@ -30,6 +29,7 @@ duplicates = 0
 notjoined = 0
 lockedtokens = 0
 invalidTokens = 0
+stopEvent = threading.Event()
 
 # SYNC functions
 def clearConsole(): return os.system(
@@ -54,7 +54,15 @@ def showMenu():
     print(
         f'{Style.BRIGHT}{Fore.BLUE}12: VC spammer {Style.RESET_ALL}')
     print(
-        f'{Style.BRIGHT}{Fore.BLUE}13: Exit {Style.RESET_ALL}')
+        f'{Style.BRIGHT}{Fore.BLUE}13: Reaction Spammer {Style.RESET_ALL}')
+    print(
+        f'{Style.BRIGHT}{Fore.BLUE}14: Global name scrapper {Style.RESET_ALL}')
+    print(
+        f'{Style.BRIGHT}{Fore.BLUE}15: Avatar scrapper {Style.RESET_ALL}')
+    print(
+        f'{Style.BRIGHT}{Fore.BLUE}16: Avatar adder {Style.RESET_ALL}')
+    print(
+        f'{Style.BRIGHT}{Fore.BLUE}17: Exit {Style.RESET_ALL}')
 def changeFormat(token: str):
     if ":" not in token or len(token.split(":")) == 2:
         token = token if ":" not in token else token.split(":")[1]
@@ -82,11 +90,36 @@ async def scrapeMassMention(token, guildId, channelId):
         open("scraped/massmention.txt", "a").write(member + "\n")
     console.s_print(f"Total Scrapped: {len(members)}")
     return True
-def vcSpammer(token: str, guild: str, channelId: str):
-    while True:
-        sock = DiscordSocket(token)
-        sock.run(channelId, guild)
-        console.s_print(f"Joined vc: {token}")
+async def runTasksUntilEnter(coros: list):
+    """Run worker coroutines concurrently until the user presses ENTER.
+
+    The blocking input() is run in a thread so the workers keep flowing on the event
+    loop while we wait. As soon as ENTER is pressed we flip stopEvent (for thread
+    based workers) and cancel every task, then return so the caller can go back to
+    the menu — no more pools left running in the background."""
+    coros = [c for c in coros if c is not None]
+    if not coros:
+        return
+    stopEvent.clear()
+    tasks = [asyncio.create_task(c) for c in coros]
+    console.w_print("Tasks are running. Press ENTER to stop them and return to the menu.")
+    await asyncio.to_thread(input)
+    stopEvent.set()
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    console.s_print("All tasks stopped. Returning to menu...")
+
+async def vcSpammer(token: str, guild: str, channelId: str):
+    """Keeps a token sitting in the voice channel: join, let the short-lived gateway
+    session drop, then rejoin — looping until stopEvent is set (user pressed ENTER)."""
+    while not stopEvent.is_set():
+        try:
+            await asyncio.to_thread(DiscordSocket(token).run, channelId, guild)
+            console.s_print(f"Joined vc: {token}")
+        except Exception as e:
+            console.f_print(f"{token} failed to join vc: {e}")
+        await asyncio.sleep(5)
 async def usernameChanger(token: str, username: str):
     if ":" not in token:
         console.f_print(f"{token} is not [Email:Pass:Token]")
@@ -101,23 +134,111 @@ async def bioChanger(token: str, bio: str):
     m = await buildMultiTool(token)
     await m.bioChange(bio)
 
-async def scrapeMembers(token, guildId, channelId):
+def readAvatarFile(path: str) -> list:
+    try:
+        return [line for line in open(path, encoding="utf-8").read().splitlines() if line.strip()]
+    except FileNotFoundError:
+        return []
+
+def loadAvatars() -> Union[list, None]:
+    """Asks the user where to take avatars from (scraped/input), falling back to
+    the other file when the chosen one is empty. Returns a list of avatar urls,
+    or None if both files are empty."""
+    source = input(
+        f"{Fore.GREEN}{Style.BRIGHT}Where do you want to take avatars from? (scraped/input) {Style.RESET_ALL}").lower().strip()
+    if source == "input":
+        primary, fallback = "input/avatars.txt", "scraped/avatars.txt"
+    else:
+        primary, fallback = "scraped/avatars.txt", "input/avatars.txt"
+    avatars = readAvatarFile(primary)
+    if avatars:
+        return avatars
+    console.w_print(f"{primary} is empty, taking avatars from {fallback} instead...")
+    avatars = readAvatarFile(fallback)
+    if avatars:
+        return avatars
+    console.f_print(
+        "Both avatar files are empty. Add avatar URLs to input/avatars.txt or scrape avatars first.")
+    return None
+
+async def avatarChanger(token: str, avatarUrl: str):
+    m = await buildMultiTool(token)
+    if m is None:
+        return None
+    await m.avatarChange(avatarUrl)
+
+async def scrapeMembers(token, guildId, channelId, emptyFirst=True):
     o = await buildMultiTool(token)
     res = await o.getGuild(guildId)
     if "name" not in res:
-        return await scrapeMembers(random.choice(open("input/tokens.txt").read().splitlines()), guildId, channelId)
-    open("scraped/massmention.txt", "w").write("")
+        return await scrapeMembers(random.choice(open("input/tokens.txt").read().splitlines()), guildId, channelId, emptyFirst)
+    if emptyFirst:
+        open("scraped/members.txt", "w", encoding="utf-8").write("")
     console.s_print(f"Scraping in {guildId} with {token}")
     members = scrape(token, guildId, channelId)
-    for member in members:
-        console.s_print(f"Scraped {member}")
-        open("scraped/members.txt", "a").write(member + "\n")
+    with open("scraped/members.txt", "a", encoding="utf-8") as f:
+        for member in members:
+            console.s_print(f"Scraped {member}")
+            f.write(member + "\n")
+    console.s_print(f"Total Scrapped: {len(members)}")
+    return True
+
+async def scrapeGlobalNames(token, guildId, channelId, emptyFirst=True):
+    o = await buildMultiTool(token)
+    res = await o.getGuild(guildId)
+    if "name" not in res:
+        return await scrapeGlobalNames(random.choice(open("input/tokens.txt").read().splitlines()), guildId, channelId, emptyFirst)
+    if emptyFirst:
+        open("scraped/globalnames.txt", "w", encoding="utf-8").write("")
+    console.s_print(f"Scraping global names in {guildId} with {token}")
+    members = scrape(token, guildId, channelId, "global_name")
+    with open("scraped/globalnames.txt", "a", encoding="utf-8") as f:
+        for member in members:
+            try:
+                console.s_print(f"Scraped {member}")
+            except UnicodeEncodeError:
+                console.s_print(f"Scraped {member.encode('ascii', 'replace').decode()}")
+            f.write(member + "\n")
+    console.s_print(f"Total Scrapped: {len(members)}")
+    return True
+
+async def scrapeAvatars(token, guildId, channelId, emptyFirst=True):
+    o = await buildMultiTool(token)
+    res = await o.getGuild(guildId)
+    if "name" not in res:
+        return await scrapeAvatars(random.choice(open("input/tokens.txt").read().splitlines()), guildId, channelId, emptyFirst)
+    if emptyFirst:
+        open("scraped/avatars.txt", "w", encoding="utf-8").write("")
+    console.s_print(f"Scraping avatars in {guildId} with {token}")
+    members = scrape(token, guildId, channelId, "avatar")
+    with open("scraped/avatars.txt", "a", encoding="utf-8") as f:
+        for member in members:
+            console.s_print(f"Scraped {member}")
+            f.write(member + "\n")
     console.s_print(f"Total Scrapped: {len(members)}")
     return True
 
 async def leave(token: str, guildId: str):
     o = await buildMultiTool(token)
     await o.leave(guildId)
+
+def formatEmojiName(emojiObj: dict) -> str:
+    """Human-readable label for a reaction's emoji: <:name:id> for custom emojis,
+    the raw character for unicode emojis."""
+    if emojiObj.get("id"):
+        return f"<:{emojiObj['name']}:{emojiObj['id']}>"
+    return emojiObj["name"]
+
+async def reactionSpammer(token: str, channelId: str, messageId: str, emojiObj: dict, useDelay: bool, delayConfig: Union[dict, None]):
+    m = await buildMultiTool(token)
+    if m == None:
+        return None
+    if useDelay:
+        if delayConfig["random"]:
+            await asyncio.sleep(random.uniform(delayConfig["min"], delayConfig["max"]))
+        else:
+            await asyncio.sleep(delayConfig["fixed"])
+    await m.addReactionByEmoji(messageId, channelId, emojiObj)
 
 async def buildMultiTool(token: str) -> MultiTool:
     try:
@@ -196,17 +317,12 @@ async def join(token: str, rawInvite: str, ctx: str, guildId: str, channelId: Un
         return res
     if Utility().config["joiner"]["bypassMembershipScreening"] and "show_verification_form" in req.json():
         await m.bypassScreening(guildId, rawInvite)
-    if Utility().config["joiner"]["bypassReactionVerification"] and channelId != None:
-        emojiObj = await m.getReactions(messageId, channelId)
-        if emojiObj["id"] == None:
-            emojiOut = emoji.demojize(
-                emojiObj["name"]
-            )
-        else:
-            emojiOut = emojiObj["name"] + "%3A" + emojiObj["id"]
-        if emojiOut[0] == ":" and emojiOut[len(emojiOut) - 1] == ":":
-            emojiOut = emoji.emojize(emojiOut)
-        await m.addReaction(messageId, channelId, emojiOut)
+    if Utility().config["joiner"].get("bypassOnboarding"):
+        await m.bypassOnboarding(guildId)
+    if Utility().config["joiner"].get("bypassDoubleCounter"):
+        await m.bypassDoubleCounter()
+    if Utility().config["joiner"].get("bypassButtonAndEmojiVerification"):
+        await m.buttonAndEmojiVerification(guildId)
     return res
 async def menu():
     global duplicates
@@ -263,11 +379,6 @@ async def menu():
             useDelay = Utility().config["joiner"]["useDelays"]
             channelId = None
             messageId = None
-            if Utility().config["joiner"]["bypassReactionVerification"]:
-                channelId = input(
-                    f"{Fore.GREEN}{Style.BRIGHT}Reaction Verifier: Enter the channelId the message is on: {Style.RESET_ALL}")
-                messageId = input(
-                    f"{Fore.GREEN}{Style.BRIGHT}Reaction Verifier: Enter the messageId of the message the reaction is on: {Style.RESET_ALL}")
             async with TaskPool(10_000) as pool:
                 for token in tokens:
                     if token in seen:
@@ -286,8 +397,17 @@ async def menu():
             console.s_print(f"Server spammer...")
             massMention = True if input(
                 f"{Fore.GREEN}{Style.BRIGHT}Do you want to use massmention? (y/n){Style.RESET_ALL}").lower() == "y" else None
-            massMentionSize = None if massMention != True else int(input(
-                f"{Fore.GREEN}{Style.BRIGHT}Enter the ammount of people you want to mention in one message: {Style.RESET_ALL}"))
+            massMentionSize = None
+            if massMention:
+                if input(f"{Fore.GREEN}{Style.BRIGHT}Do you want a random massmention size? (y/n) {Style.RESET_ALL}").lower() == "y":
+                    minSize = int(input(
+                        f"{Fore.GREEN}{Style.BRIGHT}Enter the minimum amount of people to mention: {Style.RESET_ALL}"))
+                    maxSize = int(input(
+                        f"{Fore.GREEN}{Style.BRIGHT}Enter the maximum amount of people to mention: {Style.RESET_ALL}"))
+                    massMentionSize = (minSize, maxSize)
+                else:
+                    massMentionSize = int(input(
+                        f"{Fore.GREEN}{Style.BRIGHT}Enter the ammount of people you want to mention in one message: {Style.RESET_ALL}"))
             message = input(
                 f"{Fore.GREEN}{Style.BRIGHT}Please type the message: {Style.RESET_ALL}")
             channelId = input(
@@ -297,9 +417,9 @@ async def menu():
 
             if massMention and input(f"{Fore.GREEN}{Style.BRIGHT}Do you want to use already scrapped members for massmention? (y/n) {Style.RESET_ALL}").lower() != "y":
                 await scrapeMassMention(random.choice(tokens), guildId, channelId)
-            async with TaskPool(10_000) as pool:
-                for token in tokens:
-                    await pool.put(sendMessage(token, channelId, message, massMention, massMentionSize))
+            await runTasksUntilEnter(
+                [sendMessage(token, channelId, message, massMention, massMentionSize) for token in tokens])
+            return await menu()
         if choice == 4:
             console.s_print(f"Server leaver...")
             guildId = input(
@@ -321,9 +441,8 @@ async def menu():
                 f"{Fore.GREEN}{Style.BRIGHT}Enter your message: {Style.RESET_ALL}")
             userId = input(
                 f"{Fore.GREEN}{Style.BRIGHT}Enter the vitim's userId: {Style.RESET_ALL}")
-            async with TaskPool(10_000) as pool:
-                for token in tokens:
-                    await pool.put(spamMessages(token, userId, message))
+            await runTasksUntilEnter(
+                [spamMessages(token, userId, message) for token in tokens])
             return await menu()
         if choice == 7:
             console.f_print(
@@ -374,31 +493,106 @@ async def menu():
                 f"{Fore.GREEN}{Style.BRIGHT}Enter your username and tag: {Style.RESET_ALL}").split("#")
             username = spllited[0]
             discrim = spllited[1]
-            async with TaskPool(10_000) as pool:
-                for token in tokens:
-                    await pool.put(friendRequest(token, username, discrim))
+            await runTasksUntilEnter(
+                [friendRequest(token, username, discrim) for token in tokens])
+            return await menu()
         if choice == 11:
             console.s_print("Member scrapper...")
             channelId = input(
                 f"{Fore.GREEN}{Style.BRIGHT}Enter your channelId you want to scrape: {Style.RESET_ALL}")
+            emptyFirst = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Do you want to empty the file before scrapping? (y/n) {Style.RESET_ALL}").lower() == "y"
             m = await buildMultiTool(random.choice(tokens))
             guildId = await m.getChannel(channelId)
-            await scrapeMembers(random.choice(tokens), guildId, channelId)
+            await scrapeMembers(random.choice(tokens), guildId, channelId, emptyFirst)
             return await menu()
         if choice == 12:
             console.s_print("VC Spammer...")
             channelId = input(f"{Fore.GREEN}{Style.BRIGHT}Enter your Voice channelId you want to spam: {Style.RESET_ALL}")
             m = await buildMultiTool(random.choice(tokens)) # build the multitool coroutine
             guildId = await m.getChannel(channelId=channelId)
-            pool = ThreadPool(10_000)
+            coros = []
             for token in tokens:
                 if token in seen:
                     continue
                 seen[token] = True
-                pool.apply_async(vcSpammer, (token, guildId, channelId, ))
-            pool.join()
+                coros.append(vcSpammer(token, guildId, channelId))
+            await runTasksUntilEnter(coros)
+            seen.clear()
             return await menu()
         if choice == 13:
+            console.s_print("Reaction Spammer...")
+            guildId = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Enter the guild Id: {Style.RESET_ALL}")
+            channelId = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Enter the channel Id: {Style.RESET_ALL}")
+            messageId = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Enter the message Id: {Style.RESET_ALL}")
+            m = await buildMultiTool(random.choice(tokens))
+            reactions = await m.getAllReactions(messageId, channelId)
+            if not reactions:
+                console.f_print("No reactions found on that message.")
+                input("Press enter to return to menu")
+                return await menu()
+            console.s_print("Reactions on this message:")
+            for index, reaction in enumerate(reactions):
+                print(
+                    f"{Fore.GREEN}{Style.BRIGHT}{index}: {formatEmojiName(reaction['emoji'])} (count: {reaction.get('count', '?')}){Style.RESET_ALL}")
+            selected = int(input(
+                f"{Fore.GREEN}{Style.BRIGHT}Select the reaction you want to spam (0, 1, 2 ...): {Style.RESET_ALL}"))
+            if selected < 0 or selected >= len(reactions):
+                console.f_print("Invalid reaction selection.")
+                input("Press enter to return to menu")
+                return await menu()
+            emojiObj = reactions[selected]["emoji"]
+            useDelay = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Do you want to use delays? (y/n) {Style.RESET_ALL}").lower() == "y"
+            delayConfig = None
+            if useDelay:
+                if input(f"{Fore.GREEN}{Style.BRIGHT}Do you want to use a random delay? (y/n) {Style.RESET_ALL}").lower() == "y":
+                    minDelay = float(input(
+                        f"{Fore.GREEN}{Style.BRIGHT}Enter the minimum delay (seconds): {Style.RESET_ALL}"))
+                    maxDelay = float(input(
+                        f"{Fore.GREEN}{Style.BRIGHT}Enter the maximum delay (seconds): {Style.RESET_ALL}"))
+                    delayConfig = {"random": True, "min": minDelay, "max": maxDelay}
+                else:
+                    fixedDelay = float(input(
+                        f"{Fore.GREEN}{Style.BRIGHT}Enter the fixed delay (seconds): {Style.RESET_ALL}"))
+                    delayConfig = {"random": False, "fixed": fixedDelay}
+            await runTasksUntilEnter(
+                [reactionSpammer(token, channelId, messageId, emojiObj, useDelay, delayConfig) for token in tokens])
+            return await menu()
+        if choice == 14:
+            console.s_print("Global name scrapper...")
+            channelId = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Enter your channelId you want to scrape: {Style.RESET_ALL}")
+            emptyFirst = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Do you want to empty the file before scrapping? (y/n) {Style.RESET_ALL}").lower() == "y"
+            m = await buildMultiTool(random.choice(tokens))
+            guildId = await m.getChannel(channelId)
+            await scrapeGlobalNames(random.choice(tokens), guildId, channelId, emptyFirst)
+            return await menu()
+        if choice == 15:
+            console.s_print("Avatar scrapper...")
+            channelId = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Enter your channelId you want to scrape: {Style.RESET_ALL}")
+            emptyFirst = input(
+                f"{Fore.GREEN}{Style.BRIGHT}Do you want to empty the file before scrapping? (y/n) {Style.RESET_ALL}").lower() == "y"
+            m = await buildMultiTool(random.choice(tokens))
+            guildId = await m.getChannel(channelId)
+            await scrapeAvatars(random.choice(tokens), guildId, channelId, emptyFirst)
+            return await menu()
+        if choice == 16:
+            console.s_print("Avatar adder...")
+            avatars = loadAvatars()
+            if not avatars:
+                input("Press enter to return to menu")
+                return await menu()
+            async with TaskPool(10_000) as pool:
+                for token in tokens:
+                    await pool.put(avatarChanger(token, random.choice(avatars)))
+            return await menu()
+        if choice == 17:
             exit()
         else:
             console.f_print("Invalid Choice")

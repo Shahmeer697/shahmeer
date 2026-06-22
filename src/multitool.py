@@ -53,7 +53,7 @@ class MultiTool:
             cookies={"locale": self._anti_tracking.lang},
             headers={
                 "Host": "discord.com",
-                "User-Agent": USER_AGENT,
+                "User-Agent": self._anti_tracking.ua,
                 "Accept": "*/*",
                 "Accept-Language": f"{self._anti_tracking.lang},en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br, zstd",

@@ -5,7 +5,7 @@ from ._utility import gatewayProperties
 class DiscordSocket(threading.Thread):
     def __init__(self, token: str) -> None:
         if ":" in token:
-            token = token.split(":")[-1]
+            token = token.split(":")[2]
         self.token = token
         threading.Thread.__init__(self)
         self.ws = websocket.WebSocket()

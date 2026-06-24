@@ -43,7 +43,7 @@ class MultiTool:
         self._anti_tracking = AntiTracking(BUILD_NUM)
 
         if ":" in token:
-            token = token.split(":")[-1]
+            token = token.split(":")[2]
 
         self._launch_id = str(uuid.uuid4())
         self._launch_signature = str(uuid.uuid4())
@@ -53,7 +53,7 @@ class MultiTool:
             cookies={"locale": self._anti_tracking.lang},
             headers={
                 "Host": "discord.com",
-                "User-Agent": USER_AGENT,
+                "User-Agent": self._anti_tracking.ua,
                 "Accept": "*/*",
                 "Accept-Language": f"{self._anti_tracking.lang},en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -149,6 +149,7 @@ class MultiTool:
             f"{self.token} captcha detected. solving thru {self._utility.config.get('captcha').get('api')}"
         )
         captcha_sitekey = data["captcha_sitekey"]
+        print(captcha_sitekey)
         captcha_rqtoken = data["captcha_rqtoken"]
         captcha_rqdata = data["captcha_rqdata"]
         captcha_session_id = data["captcha_session_id"]
@@ -168,10 +169,14 @@ class MultiTool:
         self.client.headers.pop("X-Captcha-Rqtoken", None)
         self.client.headers.pop("X-Captcha-Session-Id", None)
         if req.status_code == 200:
-            console.s_print(f"{self.token} successfully joined discord.gg/{rawInvite}")
+            console.s_print(
+                f"{self.token} successfully joined discord.gg/{rawInvite}, request response: {req.json()}"
+            )
             return True, req
         else:
-            console.f_print(f"{self.token} failed to join discord.gg/{rawInvite}")
+            console.f_print(
+                f"{self.token} failed to join discord.gg/{rawInvite}, request response: {req.json()}"
+            )
             return False, req
 
     async def bypassScreening(self, guildId: str, rawInvite: str):
@@ -574,7 +579,9 @@ class MultiTool:
             return "image/png"
         elif data[0:3] == b"\xff\xd8\xff" or data[6:10] in (b"JFIF", b"Exif"):
             return "image/jpeg"
-        elif data.startswith((b"\x47\x49\x46\x38\x37\x61", b"\x47\x49\x46\x38\x39\x61")):
+        elif data.startswith(
+            (b"\x47\x49\x46\x38\x37\x61", b"\x47\x49\x46\x38\x39\x61")
+        ):
             return "image/gif"
         elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
             return "image/webp"

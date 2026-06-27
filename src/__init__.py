@@ -12,6 +12,7 @@ from ._utility import Utility, MPrint
 from .multitool import MultiTool
 from .scrapper import scrape
 from .discordsocket import DiscordSocket
+from .fingerprint_generator import FpScrapper
 from .global_variables import *
 
 def getVersion():

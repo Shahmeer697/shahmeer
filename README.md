@@ -28,6 +28,10 @@ Alright so this is the part you actually care about. Here is what makes V3 bette
 <li><strong>Avatar Adder</strong> - Give all your tokens a fresh look! It takes a random avatar url (from <code>scraped/avatars.txt</code> or <code>input/avatars.txt</code>, you pick the source with auto-fallback if one is empty), downloads it, converts it to base64 and sets it on each token. Every token gets a random avatar so they dont all look the same.</li>
 <li><strong>Empty before scrapping</strong> - All of the scrapping options now ask if you want to empty the file first before scrapping, so you dont have to clear them manually.</li>
 <li><strong>Smarter joiner delays</strong> - When <code>useDelays</code> is on the joiner now asks if you want a random delay, and if so lets you set a min and max so the joins look more human. Joins run on a single thread so the delay is actually respected between every token.</li>
+<li><strong>Fp Scrapper</strong> - Brand new feature! Generates thousands of valid X-Fingerprints and saves them by date to <code>scraped/fingerprints/fps-{date}.txt</code>. It rotates every request across your whole proxy list (each IP is its own rate-limit bucket) and batches the writes to disk, so its stupidly fast. Just hit Ctrl+C when you have enough.</li>
+<li><strong>Change Global Name</strong> - Brand new feature! Change the global (display) name on all your tokens at once. Use one name for every token, or pull random names from <code>scraped/globalnames.txt</code> or <code>input/globalnames.txt</code>.</li>
+<li><strong>Check if token is in a server</strong> - Brand new feature! Give it a guildId and it checks every token, then optionally separates the ones that are in the server into <code>input/tokens_in_server_{guildId}.txt</code>.</li>
+<li><strong>Live gateway session on profile edits</strong> - The avatar adder and global name changer now open a real heartbeating gateway session for each token before patching, so Discord sees an active client and stops rejecting the change with "Unknown Session" (error 10020). Profile edits actually go through now.</li>
 
 If you would like to help with this project, please create a pull request it would be very appreciated. 
 
@@ -45,6 +49,9 @@ If you would like to help with this project, please create a pull request it wou
 <li>Global Name Scrapper(NEW)</li>
 <li>Avatar Scrapper(NEW)</li>
 <li>Avatar Adder(NEW)</li>
+<li>Change Global Name(NEW)</li>
+<li>Check if token is in a server(NEW)</li>
+<li>Fp Scrapper(NEW)</li>
 <li>Reaction adder</li>
 <li>Reaction Spammer(NEW)</li>
 <li>Anti-Tracking with httpz browser impersonation(NEW)</li>

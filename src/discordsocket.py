@@ -2,6 +2,7 @@ import websocket, threading, json, time
 from ._utility import gatewayProperties
 
 
+###
 class DiscordSocket(threading.Thread):
     def __init__(self, token: str) -> None:
         if ":" in token:
@@ -19,7 +20,14 @@ class DiscordSocket(threading.Thread):
     def heartbeat(self, interval: float):
         while self.running:
             time.sleep(interval)
-            self.send_payload({"op": 1, "d": None})
+            # close_session() may have stopped us while we were sleeping — re-check
+            # before touching the socket and swallow the close race cleanly.
+            if not self.running:
+                break
+            try:
+                self.send_payload({"op": 1, "d": None})
+            except Exception:
+                break
 
     def recieve(self):
         data = self.ws.recv()
@@ -122,6 +130,64 @@ class DiscordSocket(threading.Thread):
                 except Exception:
                     pass
         return None
+
+    def open_session(self, retries: int = 3):
+        """Opens a gateway connection, IDENTIFYs and KEEPS IT OPEN with a background
+        heartbeat, returning the session_id from READY. Unlike get_session_id this
+        does NOT close the socket — the caller must call close_session() once it is
+        done (e.g. after a profile PATCH) so Discord sees a live session the whole
+        time. Returns None (and leaves nothing open) if every attempt fails."""
+        identify = self._identify_payload(
+            125,
+            {"status": "online", "since": 0, "activities": [], "afk": False},
+            {
+                "guild_hashes": {},
+                "highest_last_message_id": "0",
+                "read_state_version": 0,
+                "user_guild_settings_version": -1,
+                "user_settings_version": -1,
+            },
+        )
+        for _ in range(retries):
+            try:
+                self.running = True
+                self.ws = websocket.WebSocket()
+                self.ws.connect(
+                    "wss://gateway.discord.gg/?encoding=json&v=9",
+                    origin="https://discord.com",
+                )
+                interval = self.recieve()["d"]["heartbeat_interval"] / 1000
+                # keep the connection alive in the background so the session stays valid
+                threading.Thread(
+                    target=self.heartbeat, args=(interval,), daemon=True
+                ).start()
+                self.send_payload(identify)
+                while True:
+                    data = self.recieve()
+                    if (
+                        data
+                        and isinstance(data.get("d"), dict)
+                        and "session_id" in data["d"]
+                    ):
+                        return data["d"]["session_id"]
+            except Exception:
+                self.running = False
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
+                time.sleep(1)
+        self.running = False
+        return None
+
+    def close_session(self):
+        """Tear down a session opened with open_session(): stop the heartbeat thread
+        and close the socket. Safe to call even if the socket is already gone."""
+        self.running = False
+        try:
+            self.ws.close()
+        except Exception:
+            pass
 
     def get_guild_channels(self, guild_id: str, retries: int = 3):
         """Opens a short-lived gateway connection, identifies, and pulls the guild's

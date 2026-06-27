@@ -9,6 +9,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 """
 
+###
+
 print("MultiTool is starting...\nGetting discord buildNumber")
 from src import (
     MultiTool,
@@ -18,6 +20,7 @@ from src import (
     global_variables,
     _captcha,
     DiscordSocket,
+    FpScrapper,
 )
 import json
 import threading
@@ -34,6 +37,7 @@ from tasksio import TaskPool
 # VARIABLES
 console = MPrint()
 goodtokens = []
+in_server = []
 seen = {}
 duplicates = 0
 notjoined = 0
@@ -68,7 +72,12 @@ def showMenu():
     print(f"{Style.BRIGHT}{Fore.BLUE}14: Global name scrapper {Style.RESET_ALL}")
     print(f"{Style.BRIGHT}{Fore.BLUE}15: Avatar scrapper {Style.RESET_ALL}")
     print(f"{Style.BRIGHT}{Fore.BLUE}16: Avatar adder {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}17: Exit {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}17: Fp scrapper {Style.RESET_ALL}")
+    print(
+        f"{Style.BRIGHT}{Fore.BLUE}18: Check if token is in a server {Style.RESET_ALL}"
+    )
+    print(f"{Style.BRIGHT}{Fore.BLUE}19: Change global name {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}20: Exit {Style.RESET_ALL}")
 
 
 def changeFormat(token: str):
@@ -158,6 +167,13 @@ async def usernameChanger(token: str, username: str):
 async def bioChanger(token: str, bio: str):
     m = await buildMultiTool(token)
     await m.bioChange(bio)
+
+
+async def globalNameChanger(token: str, globalName: str):
+    m = await buildMultiTool(token)
+    if m is None:
+        return None
+    await m.globalNameChange(globalName)
 
 
 def readAvatarFile(path: str) -> list:
@@ -315,6 +331,14 @@ async def buildMultiTool(token: str) -> MultiTool:
     except Exception as e:
         console.f_print(f"Error while building Multitool Coroutine: {e}")
         return await buildMultiTool(token)
+
+
+async def checkInServer(token: str, guildId: str):
+    m = await buildMultiTool(token)
+    if m is None:
+        return None
+    if await m.checkServer(guildId):
+        in_server.append(token)
 
 
 async def sendMessage(
@@ -823,6 +847,79 @@ async def menu():
                     await pool.put(avatarChanger(token, random.choice(avatars)))
             return await menu()
         if choice == 17:
+            console.s_print("Fp scrapper...")
+            scrapper = FpScrapper()
+            try:
+                await scrapper.generate_fps()
+            except KeyboardInterrupt:
+                scrapper._stop.set()
+                console.w_print("Stopping fingerprint generator...")
+            return await menu()
+        if choice == 18:
+            console.s_print("Check if token is in a server...")
+            guildId = input(
+                f"[>] {Fore.GREEN}{Style.BRIGHT}Enter the guild Id: {Style.RESET_ALL}"
+            )
+            async with TaskPool(10_000) as pool:
+                for token in tokens:
+                    await pool.put(checkInServer(token, guildId))
+            console.s_print(f"{len(in_server)} token(s) are in {guildId}")
+            if (
+                in_server
+                and input(
+                    f"[>] {Fore.GREEN}{Style.BRIGHT}Do you want to separate the tokens that are in the server? (y/n) {Style.RESET_ALL}"
+                ).lower()
+                == "y"
+            ):
+                with open(
+                    f"input/tokens_in_server_{guildId}.txt", "a", encoding="utf-8"
+                ) as f:
+                    for token in in_server:
+                        f.write(f"{token}\n")
+                console.s_print(
+                    f"Saved {len(in_server)} token(s) to input/tokens_in_server_{guildId}.txt"
+                )
+            in_server.clear()
+            return await menu()
+        if choice == 19:
+            console.s_print("Change global name...")
+            oneForAll = (
+                input(
+                    f"[>] {Fore.GREEN}{Style.BRIGHT}Do you want to use one global name for all tokens? (y/n) {Style.RESET_ALL}"
+                ).lower()
+                == "y"
+            )
+            globalNames = None
+            if oneForAll:
+                staticName = input(
+                    f"[>] {Fore.GREEN}{Style.BRIGHT}Enter the global name: {Style.RESET_ALL}"
+                )
+            else:
+                source = (
+                    input(
+                        f"[>] {Fore.GREEN}{Style.BRIGHT}Where do you want to take global names from? (scraped/input) {Style.RESET_ALL}"
+                    )
+                    .lower()
+                    .strip()
+                )
+                path = (
+                    "input/globalnames.txt"
+                    if source == "input"
+                    else "scraped/globalnames.txt"
+                )
+                globalNames = readAvatarFile(path)
+                if not globalNames:
+                    console.f_print(
+                        f"{path} is empty. Add global names or scrape them first."
+                    )
+                    input("Press enter to return to menu")
+                    return await menu()
+            async with TaskPool(10_000) as pool:
+                for token in tokens:
+                    name = staticName if oneForAll else random.choice(globalNames)
+                    await pool.put(globalNameChanger(token, name))
+            return await menu()
+        if choice == 20:
             exit()
         else:
             console.f_print("Invalid Choice")

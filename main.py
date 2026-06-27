@@ -9,6 +9,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 """
 
+###
+
 print("MultiTool is starting...\nGetting discord buildNumber")
 from src import (
     MultiTool,
@@ -71,7 +73,9 @@ def showMenu():
     print(f"{Style.BRIGHT}{Fore.BLUE}15: Avatar scrapper {Style.RESET_ALL}")
     print(f"{Style.BRIGHT}{Fore.BLUE}16: Avatar adder {Style.RESET_ALL}")
     print(f"{Style.BRIGHT}{Fore.BLUE}17: Fp scrapper {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}18: Check if token is in a server {Style.RESET_ALL}")
+    print(
+        f"{Style.BRIGHT}{Fore.BLUE}18: Check if token is in a server {Style.RESET_ALL}"
+    )
     print(f"{Style.BRIGHT}{Fore.BLUE}19: Change global name {Style.RESET_ALL}")
     print(f"{Style.BRIGHT}{Fore.BLUE}20: Exit {Style.RESET_ALL}")
 
@@ -860,10 +864,16 @@ async def menu():
                 for token in tokens:
                     await pool.put(checkInServer(token, guildId))
             console.s_print(f"{len(in_server)} token(s) are in {guildId}")
-            if in_server and input(
-                f"[>] {Fore.GREEN}{Style.BRIGHT}Do you want to separate the tokens that are in the server? (y/n) {Style.RESET_ALL}"
-            ).lower() == "y":
-                with open(f"input/tokens_in_server_{guildId}.txt", "a", encoding="utf-8") as f:
+            if (
+                in_server
+                and input(
+                    f"[>] {Fore.GREEN}{Style.BRIGHT}Do you want to separate the tokens that are in the server? (y/n) {Style.RESET_ALL}"
+                ).lower()
+                == "y"
+            ):
+                with open(
+                    f"input/tokens_in_server_{guildId}.txt", "a", encoding="utf-8"
+                ) as f:
                     for token in in_server:
                         f.write(f"{token}\n")
                 console.s_print(
@@ -873,22 +883,35 @@ async def menu():
             return await menu()
         if choice == 19:
             console.s_print("Change global name...")
-            oneForAll = input(
-                f"[>] {Fore.GREEN}{Style.BRIGHT}Do you want to use one global name for all tokens? (y/n) {Style.RESET_ALL}"
-            ).lower() == "y"
+            oneForAll = (
+                input(
+                    f"[>] {Fore.GREEN}{Style.BRIGHT}Do you want to use one global name for all tokens? (y/n) {Style.RESET_ALL}"
+                ).lower()
+                == "y"
+            )
             globalNames = None
             if oneForAll:
                 staticName = input(
                     f"[>] {Fore.GREEN}{Style.BRIGHT}Enter the global name: {Style.RESET_ALL}"
                 )
             else:
-                source = input(
-                    f"[>] {Fore.GREEN}{Style.BRIGHT}Where do you want to take global names from? (scraped/input) {Style.RESET_ALL}"
-                ).lower().strip()
-                path = "input/globalnames.txt" if source == "input" else "scraped/globalnames.txt"
+                source = (
+                    input(
+                        f"[>] {Fore.GREEN}{Style.BRIGHT}Where do you want to take global names from? (scraped/input) {Style.RESET_ALL}"
+                    )
+                    .lower()
+                    .strip()
+                )
+                path = (
+                    "input/globalnames.txt"
+                    if source == "input"
+                    else "scraped/globalnames.txt"
+                )
                 globalNames = readAvatarFile(path)
                 if not globalNames:
-                    console.f_print(f"{path} is empty. Add global names or scrape them first.")
+                    console.f_print(
+                        f"{path} is empty. Add global names or scrape them first."
+                    )
                     input("Press enter to return to menu")
                     return await menu()
             async with TaskPool(10_000) as pool:

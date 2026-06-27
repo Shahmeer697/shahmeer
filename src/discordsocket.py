@@ -2,6 +2,7 @@ import websocket, threading, json, time
 from ._utility import gatewayProperties
 
 
+###
 class DiscordSocket(threading.Thread):
     def __init__(self, token: str) -> None:
         if ":" in token:
@@ -157,7 +158,9 @@ class DiscordSocket(threading.Thread):
                 )
                 interval = self.recieve()["d"]["heartbeat_interval"] / 1000
                 # keep the connection alive in the background so the session stays valid
-                threading.Thread(target=self.heartbeat, args=(interval,), daemon=True).start()
+                threading.Thread(
+                    target=self.heartbeat, args=(interval,), daemon=True
+                ).start()
                 self.send_payload(identify)
                 while True:
                     data = self.recieve()

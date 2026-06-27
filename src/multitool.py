@@ -43,7 +43,7 @@ class MultiTool:
         self._anti_tracking = AntiTracking(BUILD_NUM)
 
         if ":" in token:
-            token = token.split(":")[-1]
+            token = token.split(":")[2]
 
         self._launch_id = str(uuid.uuid4())
         self._launch_signature = str(uuid.uuid4())
@@ -53,10 +53,15 @@ class MultiTool:
             cookies={"locale": self._anti_tracking.lang},
             headers={
                 "Host": "discord.com",
-                "User-Agent": USER_AGENT,
+                "User-Agent": self._anti_tracking.ua,
                 "Accept": "*/*",
                 "Accept-Language": f"{self._anti_tracking.lang},en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "Priority": "u=0",
+                "TE": "trailers",
             },
             timeout=self._utility.config["requestTimeout"],
             proxy=self._utility.proxy,
@@ -149,6 +154,7 @@ class MultiTool:
             f"{self.token} captcha detected. solving thru {self._utility.config.get('captcha').get('api')}"
         )
         captcha_sitekey = data["captcha_sitekey"]
+        print(captcha_sitekey)
         captcha_rqtoken = data["captcha_rqtoken"]
         captcha_rqdata = data["captcha_rqdata"]
         captcha_session_id = data["captcha_session_id"]
@@ -168,10 +174,14 @@ class MultiTool:
         self.client.headers.pop("X-Captcha-Rqtoken", None)
         self.client.headers.pop("X-Captcha-Session-Id", None)
         if req.status_code == 200:
-            console.s_print(f"{self.token} successfully joined discord.gg/{rawInvite}")
+            console.s_print(
+                f"{self.token} successfully joined discord.gg/{rawInvite}, request response: {req.json()}"
+            )
             return True, req
         else:
-            console.f_print(f"{self.token} failed to join discord.gg/{rawInvite}")
+            console.f_print(
+                f"{self.token} failed to join discord.gg/{rawInvite}, request response: {req.json()}"
+            )
             return False, req
 
     async def bypassScreening(self, guildId: str, rawInvite: str):
@@ -188,6 +198,17 @@ class MultiTool:
             f"{self.token} bypassed membership screening for {guildId}(discord.gg/{rawInvite}) successfully!"
         )
         return True
+
+    async def checkServer(self, guildId: str = None):
+        res = await self.client.get("https://discord.com/api/v9/users/@me/guilds")
+        if res.status_code == 200:
+            guilds = res.json()
+            for guild in guilds:
+                if guild["id"] == guildId:
+                    return True
+                continue
+            return False
+        return False
 
     async def bypassOnboarding(self, guildId: str):
         """Ports the Go bypassOnboarding: fetch the guild's onboarding prompts,
@@ -574,11 +595,35 @@ class MultiTool:
             return "image/png"
         elif data[0:3] == b"\xff\xd8\xff" or data[6:10] in (b"JFIF", b"Exif"):
             return "image/jpeg"
-        elif data.startswith((b"\x47\x49\x46\x38\x37\x61", b"\x47\x49\x46\x38\x39\x61")):
+        elif data.startswith(
+            (b"\x47\x49\x46\x38\x37\x61", b"\x47\x49\x46\x38\x39\x61")
+        ):
             return "image/gif"
         elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
             return "image/webp"
         return "image/png"
+
+    async def globalNameChange(self, global_name: str) -> bool:
+        """Change global name of a token, the name can either be taken from input/scraped or it can be a static name."""
+        # Keep a live gateway session open across the PATCH so Discord sees an
+        # active client session for this token (avoids 'Unknown Session').
+        socket = DiscordSocket(self.token)
+        await asyncio.to_thread(socket.open_session)
+        try:
+            res = await self.client.patch(
+                "https://discord.com/api/v9/users/@me",
+                json={"global_name": global_name},
+            )
+        finally:
+            await asyncio.to_thread(socket.close_session)
+        if res.status_code == 200:
+            console.s_print(f"{self.token} changed global name to: {global_name}")
+            return True
+        else:
+            console.f_print(
+                f"{self.token} failed to change global name [{res.status_code}]"
+            )
+            return False
 
     async def avatarChange(self, avatarUrl: str):
         """Downloads the image at avatarUrl, encodes it as a base64 data URI and
@@ -611,10 +656,17 @@ class MultiTool:
         )
         now = datetime.now()
         avatarDescription = f"images, added {now.day} {now.strftime('%B %Y at %H:%M')}"
-        req = await self.client.patch(
-            "https://discord.com/api/v9/users/@me",
-            json={"avatar": dataUri, "avatar_description": avatarDescription},
-        )
+        # Keep a live gateway session open across the PATCH so Discord sees an
+        # active client session for this token (avoids 'Unknown Session' 10020).
+        socket = DiscordSocket(self.token)
+        await asyncio.to_thread(socket.open_session)
+        try:
+            req = await self.client.patch(
+                "https://discord.com/api/v9/users/@me",
+                json={"avatar": dataUri, "avatar_description": avatarDescription},
+            )
+        finally:
+            await asyncio.to_thread(socket.close_session)
         self.client.headers.pop("X-Discord-Original-MD5", None)
         if req.status_code != 200:
             console.f_print(

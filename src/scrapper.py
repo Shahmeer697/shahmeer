@@ -30,9 +30,11 @@ class LazyGuildScraper:
     member-count-aware ranges and adaptive range-jumping when scraping stalls.
     """
 
-    def __init__(self, token: str, guild_id: str, channel_id: str, scrape_field: str = "id"):
+    def __init__(
+        self, token: str, guild_id: str, channel_id: str, scrape_field: str = "id"
+    ):
         if ":" in token:
-            token = token.split(":")[-1]
+            token = token.split(":")[2]
         self.token = token
         self.guild_id = guild_id
         self.channel_id = channel_id

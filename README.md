@@ -32,6 +32,10 @@ Alright so this is the part you actually care about. Here is what makes V3 bette
 <li><strong>Change Global Name</strong> - Brand new feature! Change the global (display) name on all your tokens at once. Use one name for every token, or pull random names from <code>scraped/globalnames.txt</code> or <code>input/globalnames.txt</code>.</li>
 <li><strong>Check if token is in a server</strong> - Brand new feature! Give it a guildId and it checks every token, then optionally separates the ones that are in the server into <code>input/tokens_in_server_{guildId}.txt</code>.</li>
 <li><strong>Live gateway session on profile edits</strong> - The avatar adder and global name changer now open a real heartbeating gateway session for each token before patching, so Discord sees an active client and stops rejecting the change with "Unknown Session" (error 10020). Profile edits actually go through now.</li>
+<li><strong>Reorganized menu (categories + submenus)</strong> - The menu got way too long, so everything is now grouped into clean categories: <strong>Token Tools</strong>, <strong>Server Joiner</strong>, <strong>Scraping Menu</strong>, <strong>Mass DM Menu</strong>, <strong>Profile Changer</strong>, <strong>Raiding Menu</strong> and <strong>Adder Menu</strong>. Pick a category, do your thing, hit 0 to go back. Adding new features is easy now too.</li>
+<li><strong>Adder Menu</strong> - The old "Reaction Spammer" and "Friends Spammer" are renamed to <strong>Reaction adder</strong> and <strong>Friend adder</strong> and live in their own Adder Menu.</li>
+<li><strong>Smart Raid</strong> - Brand new feature! Give it a guildId and it does all the thinking for you. It works out which of your tokens are actually in the server, then for each one it pulls the channel list and your member roles and resolves the <em>real</em> per-channel permissions (the full Discord algorithm: @everyone base + role perms -> @everyone overwrite -> role overwrites -> member overwrite, with owner/admin bypass). Every channel a token can actually write in (text, announcement, forum and voice/stage text chat) goes into its personal hit list. The whole recon runs concurrently so it's fast even with thousands of tokens. Then you pick a single message or multiple comma-separated contents, optionally turn on massmention/scraping just like the server spammer, and every token raids only the channels it's allowed to post in.</li>
+<li><strong>Force proxies on raids</strong> - New <code>turn_off_proxyless_on_raid</code> config option. When it's on, the raid features (Server Spammer and Smart Raid) automatically use proxies even if you're running proxyless globally - but only if you actually have proxies in <code>input/proxies.txt</code>. Everything else still respects your global proxyless setting.</li>
 
 If you would like to help with this project, please create a pull request it would be very appreciated. 
 
@@ -52,8 +56,10 @@ If you would like to help with this project, please create a pull request it wou
 <li>Change Global Name(NEW)</li>
 <li>Check if token is in a server(NEW)</li>
 <li>Fp Scrapper(NEW)</li>
+<li>Smart Raid(NEW)</li>
 <li>Reaction adder</li>
 <li>Reaction Spammer(NEW)</li>
+<li>Friend adder</li>
 <li>Anti-Tracking with httpz browser impersonation(NEW)</li>
 <li>VC Spammer</li>
 <li>Username Scrapper(Soon)</li>
@@ -68,6 +74,7 @@ If you would like to help with this project, please create a pull request it wou
 |-----------------------------------------------|------|----------------------------------------------------------------------------------------------------------------------------------------|
 | <code>proxy.protocol</code>                   | str  | Your proxy protocol, by default its http.                                                                                             |
 | <code>proxy.proxyless</code>                  | bool | Set this to true if you want to use the tool without proxies.                                                                          |
+| <code>proxy.turn_off_proxyless_on_raid</code> | bool | When true, raid features (Server Spammer & Smart Raid) force proxies on even if proxyless is true - but only if input/proxies.txt has proxies. |
 | <code>captcha.api</code>                      | str  | The captcha api you are gonna use to bypass captcha on join.                                                                           |
 | <code>captcha.key</code>                      | str  | Your api key for the captcha api.                                                                                                      |
 | <code>joiner.useDelays</code>                 | bool | If you want to use delays on the joiner to avoid being rate limited and detected.                                                     |
@@ -88,7 +95,8 @@ If you would like to help with this project, please create a pull request it wou
 {
     "proxy": {
         "protocol": "http",
-        "proxyless": true
+        "proxyless": true,
+        "turn_off_proxyless_on_raid": true
     },
     "captcha": {
         "api": "flanker.wtf",

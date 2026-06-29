@@ -13,10 +13,35 @@ class Utility:
     def getConfig(self):
         return json.loads(open("config.json").read())
 
-    def getProxy(self):
-        if self.config["proxy"]["proxyless"]:
+    def hasProxies(self):
+        """True if input/proxies.txt holds at least one non-empty line."""
+        try:
+            return any(
+                line.strip()
+                for line in open("input/proxies.txt").read().splitlines()
+            )
+        except FileNotFoundError:
+            return False
+
+    def getProxy(self, forceProxies: bool = False):
+        proxyless = self.config["proxy"]["proxyless"]
+        # Raid features can force proxies on (only when proxyless is currently on,
+        # the config opts in, and we actually have proxies to use).
+        if (
+            forceProxies
+            and proxyless
+            and self.config["proxy"].get("turn_off_proxyless_on_raid")
+            and self.hasProxies()
+        ):
+            proxyless = False
+        if proxyless:
             return None
-        return f"{self.config['proxy']['protocol']}://{random.choice(open('input/proxies.txt').read().splitlines())}"
+        lines = [
+            line.strip()
+            for line in open("input/proxies.txt").read().splitlines()
+            if line.strip()
+        ]
+        return f"{self.config['proxy']['protocol']}://{random.choice(lines)}"
 
     def getBuildNum(self):
         """Gets the build number that discord is currently on, makes the x-super-properties header more realistic."""

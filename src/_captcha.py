@@ -1,7 +1,7 @@
 from types import NoneType
 import typing
 import twocaptcha
-import httpz
+import httpx
 from ._utility import Utility, MPrint, USER_AGENT
 
 console = MPrint()
@@ -9,7 +9,7 @@ console = MPrint()
 
 class Captcha:
     def __init__(self):
-        self._client = httpz.AsyncClient()
+        self._client = httpx.AsyncClient()
         self._utils = Utility()
         self.api = self._utils.config["captcha"]["api"]
         self.key = self._utils.config["captcha"]["key"]
@@ -45,7 +45,7 @@ class Captcha:
                 return resp.json()["response"], captcha_data
         except Exception as e:
             print(e)
-            return self.getCaptchaPrivate(captcha_data, proxy)
+            return await self.getCaptchaPrivate(captcha_data, proxy)
 
     async def getCaptcha(self, sitekey: str, rqdata: str, proxy: str):
         if self.api == "2captcha.com":

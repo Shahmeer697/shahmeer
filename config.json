@@ -1,7 +1,8 @@
 {
     "proxy": {
         "protocol": "http",
-        "proxyless": false
+        "proxyless": true,
+        "turn_off_proxyless_on_raid": false
     },
     "captcha": {
         "api": "flanker.wtf",
@@ -9,7 +10,7 @@
     },
     "joiner": {
         "useDelays": true,
-        "delay": 15,
+        "delay": 5,
         "bypassMembershipScreening": true,
         "bypassOnboarding": true,
         "bypassButtonAndEmojiVerification": true,

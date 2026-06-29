@@ -40,7 +40,7 @@ class MultiTool:
     # Multitool main class
     """
 
-    async def _init(self, token: str):
+    async def _init(self, token: str, forceProxy: bool = False):
         self._utility = Utility()
         self._anti_tracking = AntiTracking(BUILD_NUM)
 
@@ -66,7 +66,7 @@ class MultiTool:
                 "TE": "trailers",
             },
             timeout=self._utility.config["requestTimeout"],
-            proxy=self._utility.proxy,
+            proxy=self._utility.getProxy(forceProxies=forceProxy),
             ja3=self._anti_tracking.ja3,
             h2_fingerprint=self._anti_tracking.akamai,
             browser="firefox",
@@ -132,59 +132,67 @@ class MultiTool:
         return f"{self.__generate_nonce()}.{suffix}"
 
     async def join(self, rawInvite: str, ctxProperties: str):
-        self.client.headers["Referer"] = "https://discord.com/channels/@me"
-        self.client.headers["X-Context-Properties"] = ctxProperties
-        sessionId = await asyncio.to_thread(DiscordSocket(self.token).get_session_id)
-        if sessionId is None:
-            console.w_print(
-                f"{self.token} couldn't grab a gateway session_id; attempting join anyway"
-            )
-        req = await self.client.post(
-            f"https://discord.com/api/v9/invites/{rawInvite}",
-            json={"session_id": sessionId},
-        )
-        data = req.json()
-        if "captcha_key" not in data:
-            self.client.headers.pop("X-Context-Properties", None)
-            self.client.headers.pop("Referer", None)
-            if data.get("message") == "The user is banned from this guild.":
-                console.f_print(f"{self.token} is banned from this server.")
-                return False, req
-            console.s_print(f"{self.token} successfully joined discord.gg/{rawInvite}")
-            return True, req
-        console.w_print(
-            f"{self.token} captcha detected. solving thru {self._utility.config.get('captcha').get('api')}"
-        )
-        captcha_sitekey = data["captcha_sitekey"]
-        print(captcha_sitekey)
-        captcha_rqtoken = data["captcha_rqtoken"]
-        captcha_rqdata = data["captcha_rqdata"]
-        captcha_session_id = data["captcha_session_id"]
+        socket = DiscordSocket(self.token)
+        try:
+            self.client.headers["Referer"] = "https://discord.com/channels/@me"
+            self.client.headers["X-Context-Properties"] = ctxProperties
+            await asyncio.to_thread(socket.open_session)
 
-        captcha_key = await self._captcha.getCaptchaPrivate(data, self._utility.proxy)
-        self.client.headers["X-Captcha-Key"] = captcha_key
-        self.client.headers["X-Captcha-Rqtoken"] = captcha_rqtoken
-        self.client.headers["X-Captcha-Session-Id"] = captcha_session_id
-        req = await self.client.post(
-            f"https://discord.com/api/v9/invites/{rawInvite}",
-            json={
-                "session_id": sessionId,
-            },
-        )
-        self.client.headers.pop("X-Context-Properties", None)
-        self.client.headers.pop("X-Captcha-Key", None)
-        self.client.headers.pop("X-Captcha-Rqtoken", None)
-        self.client.headers.pop("X-Captcha-Session-Id", None)
-        if req.status_code == 200:
-            console.s_print(
-                f"{self.token} successfully joined discord.gg/{rawInvite}, request response: {req.json()}"
+            sessionId = await asyncio.to_thread(socket.get_session_id)
+            if sessionId is None:
+                console.w_print(
+                    f"{self.token} couldn't grab a gateway session_id; attempting join anyway"
+                )
+            req = await self.client.post(
+                f"https://discord.com/api/v9/invites/{rawInvite}",
+                json={"session_id": sessionId},
             )
-            return True, req
-        else:
-            console.f_print(
-                f"{self.token} failed to join discord.gg/{rawInvite}, request response: {req.json()}"
+            data = req.json()
+            if "captcha_key" not in data:
+                self.client.headers.pop("X-Context-Properties", None)
+                self.client.headers.pop("Referer", None)
+                if data.get("message") == "The user is banned from this guild.":
+                    console.f_print(f"{self.token} is banned from this server.")
+                    return False, req
+                console.s_print(
+                    f"{self.token} successfully joined discord.gg/{rawInvite}"
+                )
+                return True, req
+            console.w_print(
+                f"{self.token} captcha detected. solving thru {self._utility.config.get('captcha').get('api')}"
             )
-            return False, req
+            captcha_rqtoken = data["captcha_rqtoken"]
+            captcha_session_id = data["captcha_session_id"]
+            start_time = time.time()
+            captcha_key, _data = await self._captcha.getCaptchaPrivate(
+                data, self._utility.proxy
+            )
+            end_time = time.time()
+            elapsed = round(end_time - start_time)
+            console.s_print(f"Captcha: {captcha_key[:32]} solved in {elapsed}s")
+            self.client.headers["X-Captcha-Key"] = captcha_key
+            self.client.headers["X-Captcha-Rqtoken"] = captcha_rqtoken
+            self.client.headers["X-Captcha-Session-Id"] = captcha_session_id
+            req = await self.client.post(
+                f"https://discord.com/api/v9/invites/{rawInvite}",
+                json={
+                    "session_id": sessionId,
+                },
+            )
+            self.client.headers.pop("X-Context-Properties", None)
+            self.client.headers.pop("X-Captcha-Key", None)
+            self.client.headers.pop("X-Captcha-Rqtoken", None)
+            self.client.headers.pop("X-Captcha-Session-Id", None)
+            if req.status_code == 200:
+                console.s_print(
+                    f"{self.token} successfully joined discord.gg/{rawInvite}"
+                )
+                return True, req
+            else:
+                console.f_print(f"{self.token} failed to join discord.gg/{rawInvite}")
+                return False, req
+        finally:
+            await asyncio.to_thread(socket.close_session)
 
     async def bypassScreening(self, guildId: str, rawInvite: str):
         req = await self.client.get(
@@ -427,8 +435,8 @@ class MultiTool:
         channelId: str,
         massMention: bool = False,
         massMentionSize=6,
+        scrappedMembers: list = [],
     ):
-        scrappedMembers = open("scraped/massmention.txt").read().splitlines()
         if len(scrappedMembers) < 1 and massMention:
             console.f_print(
                 f"{self.token} server has 0 members. thus mass mention wont work"
@@ -448,7 +456,8 @@ class MultiTool:
             else:
                 mentionCount = massMentionSize
             mentions = "".join(
-                f"<@{random.choice(scrappedMembers)}> " for _ in range(mentionCount)
+                f"<@{random.choice(scrappedMembers)}> ".replace("\n", "")
+                for _ in range(mentionCount)
             )
             randomChars = "".join(
                 random.choice(string.ascii_letters + string.digits)
@@ -484,11 +493,31 @@ class MultiTool:
             return True, "VALID"
 
     async def getGuild(self, guildId: str):
-        req = await self.client.get(f"https://discord.com/api/v9//guilds/{guildId}")
+        req = await self.client.get(f"https://discord.com/api/v9/guilds/{guildId}")
         if "name" not in req.json():
             console.f_print(f"{self.token} is probably not in {guildId}")
             return req.json()
         return req.json()
+
+    async def getGuildChannels(self, guildId: str):
+        """GET /guilds/{id}/channels — the array of channel objects (each carries its
+        permission_overwrites). Returns [] if the call fails or we're not in the guild.
+        """
+        req = await self.client.get(
+            f"https://discord.com/api/v9/guilds/{guildId}/channels"
+        )
+        data = req.json()
+        return data if isinstance(data, list) else []
+
+    async def getMember(self, guildId: str):
+        """GET /users/@me/guilds/{id}/member — our own member object in that guild.
+        Carries the `roles` list (role ids, minus @everyone) and the `user` object, both
+        of which we need to resolve per-channel permissions. Returns {} on failure."""
+        req = await self.client.get(
+            f"https://discord.com/api/v9/users/@me/guilds/{guildId}/member"
+        )
+        data = req.json()
+        return data if isinstance(data, dict) else {}
 
     async def getChannel(self, channelId):
         """Returns id of the server the channel is in"""
@@ -516,7 +545,7 @@ class MultiTool:
             return True
 
     async def getMessage(self, messageId, channelId):
-        """Gets the message, returns a message object 😃"""
+        """Gets the message, returns a message object"""
         req = await self.client.get(
             f"https://discord.com/api/v9/channels/{channelId}/messages?limit=1&around={messageId}"
         )

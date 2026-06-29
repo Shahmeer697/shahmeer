@@ -1,4 +1,9 @@
 __pycache__
 .DS_Store
-input/newtokas.txt
 .claude
+
+# Local data — ignore everything new dropped into input/ and scraped/.
+# (The template files already tracked in the repo stay tracked; their local
+#  edits are hidden via `git update-index --skip-worktree`. See README/notes.)
+input/
+scraped/

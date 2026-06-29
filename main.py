@@ -45,6 +45,253 @@ lockedtokens = 0
 invalidTokens = 0
 stopEvent = threading.Event()
 
+# --- Discord permission bits / channel types (used by Smart Raid) -----------
+PERM_ADMINISTRATOR = 1 << 3  # 8     — bypasses every other permission
+PERM_VIEW_CHANNEL = 1 << 10  # 1024  — must see the channel
+PERM_SEND_MESSAGES = 1 << 11  # 2048  — must be able to post in it
+# Channel types we can drop a message into: 0 text, 2 voice (text chat),
+# 5 announcement, 13 stage (text chat), 15 forum.
+MESSAGEABLE_TYPES = {0, 2, 5, 13, 15}
+
+
+def _basePermissions(guild: dict, member: dict) -> int:
+    """@everyone base permissions OR'd with the base permissions of every role the
+    member has. The @everyone role id always equals the guild id."""
+    guildId = guild["id"]
+    rolePerms = {r["id"]: int(r.get("permissions", 0)) for r in guild.get("roles", [])}
+    perms = rolePerms.get(guildId, 0)
+    for rid in member.get("roles", []):
+        perms |= rolePerms.get(rid, 0)
+    return perms
+
+
+def _channelPermissions(
+    channel: dict, guild: dict, member: dict, basePerms: int
+) -> int:
+    """Apply a channel's overwrites to the base perms following Discord's order:
+    @everyone overwrite -> union of role overwrites -> the member-specific overwrite."""
+    guildId = guild["id"]
+    memberId = member.get("user", {}).get("id")
+    memberRoles = set(member.get("roles", []))
+    perms = basePerms
+    overwrites = {o["id"]: o for o in channel.get("permission_overwrites", [])}
+
+    everyone = overwrites.get(guildId)
+    if everyone:
+        perms &= ~int(everyone.get("deny", 0))
+        perms |= int(everyone.get("allow", 0))
+
+    roleAllow = roleDeny = 0
+    for rid in memberRoles:
+        ow = overwrites.get(rid)
+        if ow:
+            roleAllow |= int(ow.get("allow", 0))
+            roleDeny |= int(ow.get("deny", 0))
+    perms &= ~roleDeny
+    perms |= roleAllow
+
+    if memberId and memberId in overwrites:
+        ow = overwrites[memberId]
+        perms &= ~int(ow.get("deny", 0))
+        perms |= int(ow.get("allow", 0))
+
+    return perms
+
+
+def channelsTokenCanWrite(guild: dict, channels: list, member: dict) -> list:
+    """Return the ids of every messageable channel this member can post in.
+    Guild owner and any ADMINISTRATOR role bypass channel overwrites entirely."""
+    memberId = member.get("user", {}).get("id")
+    base = _basePermissions(guild, member)
+    bypass = (memberId and memberId == guild.get("owner_id")) or bool(
+        base & PERM_ADMINISTRATOR
+    )
+
+    writable = []
+    for channel in channels:
+        if channel.get("type") not in MESSAGEABLE_TYPES:
+            continue
+        if bypass:
+            writable.append(channel["id"])
+            continue
+        perms = _channelPermissions(channel, guild, member, base)
+        if perms & PERM_ADMINISTRATOR:
+            writable.append(channel["id"])
+        elif (perms & PERM_VIEW_CHANNEL) and (perms & PERM_SEND_MESSAGES):
+            writable.append(channel["id"])
+    return writable
+
+
+async def smartRaidWorker(
+    token: str,
+    channels: list,
+    contents: list,
+    massMention: bool,
+    massMentionSize,
+    forceProxy: bool = False,
+):
+    """Spam one token across every channel it can write in, cycling channels and
+    picking a random content each send, until ENTER is pressed (stopEvent)."""
+    m = await buildMultiTool(token, forceProxy)
+    if m is None:
+        return None
+    try:
+        with open("scraped/massmention.txt") as fs:
+            scrappedMembers = fs.readlines()
+    except FileNotFoundError:
+        scrappedMembers = []
+    while not stopEvent.is_set():
+        for channelId in channels:
+            if stopEvent.is_set():
+                break
+            await m.sendMessageInChannel(
+                random.choice(contents),
+                channelId,
+                massMention,
+                massMentionSize,
+                scrappedMembers,
+            )
+
+
+async def _reconToken(
+    token: str, guildId: str, sem: asyncio.Semaphore, forceProxy: bool = False
+):
+    """Recon a single token: confirm it's in the guild, pull the channel list + our
+    member object, and resolve which channels it can write in. Returns
+    {"token", "channels"} or None (not in server / no writable channels / error).
+    The semaphore bounds how many of these run at once so we don't exhaust sockets."""
+    async with sem:
+        m = await buildMultiTool(token, forceProxy)
+        if m is None:
+            return None
+        guild = await m.getGuild(guildId)
+        # getGuild only returns "name" when the token is actually in the server
+        if not isinstance(guild, dict) or "name" not in guild:
+            return None
+        channels = await m.getGuildChannels(guildId)
+        member = await m.getMember(guildId)
+        if not isinstance(member, dict) or "roles" not in member:
+            member = {"roles": []}
+        channelsToFuck = channelsTokenCanWrite(guild, channels, member)
+        if not channelsToFuck:
+            console.f_print(
+                f"{token} is in {guild['name']} but can't write in any channel, skipping"
+            )
+            return None
+        console.s_print(
+            f"{token} -> {len(channelsToFuck)} writable channel(s) in {guild['name']}"
+        )
+        return {"token": token, "channels": channelsToFuck}
+
+
+async def smartRaid(tokens: list):
+    """Smart Raid: figure out which tokens are actually in the guild, resolve which
+    channels each one can write in (its own permission set), then raid every writable
+    channel — voice text chats included — with one or many message contents."""
+    console.s_print("Smart Raid...")
+    guildId = input(
+        f"[>] {Fore.GREEN}{Style.BRIGHT}Enter the guild Id: {Style.RESET_ALL}"
+    ).strip()
+
+    # Recon every (unique) token concurrently — bounded so thousands of tokens don't
+    # open thousands of sockets at once.
+    console.w_print("Scanning tokens for membership and per-channel write access...")
+    uniqueTokens = list(dict.fromkeys(tokens))
+    sem = asyncio.Semaphore(100)
+    reconResults = await asyncio.gather(
+        *[_reconToken(token, guildId, sem, forceProxy=True) for token in uniqueTokens],
+        return_exceptions=True,
+    )
+    raiders = [r for r in reconResults if isinstance(r, dict)]
+
+    if not raiders:
+        console.f_print("No tokens are in that server with write permissions.")
+        input("Press enter to return to menu")
+        return
+
+    console.s_print(f"{len(raiders)} token(s) ready to raid {guildId}")
+
+    # --- message content: single or many (comma separated) -------------------
+    multiple = (
+        input(
+            f"[>] {Fore.GREEN}{Style.BRIGHT}Do you want to use multiple message contents? (y/n) {Style.RESET_ALL}"
+        ).lower()
+        == "y"
+    )
+    if multiple:
+        raw = input(
+            f"[>] {Fore.GREEN}{Style.BRIGHT}Enter your contents separated by commas (i.e multitool is great, httpz is love, i hate you, etc...): {Style.RESET_ALL}"
+        )
+        contents = [c.strip() for c in raw.split(",") if c.strip()]
+    else:
+        contents = [
+            input(
+                f"[>] {Fore.GREEN}{Style.BRIGHT}Enter your message content: {Style.RESET_ALL}"
+            )
+        ]
+    if not contents:
+        console.f_print("No content provided.")
+        input("Press enter to return to menu")
+        return
+
+    # --- mass mention (mirrors the normal Server Spammer) --------------------
+    massMention = (
+        input(
+            f"{Fore.GREEN}{Style.BRIGHT}Do you want to use massmention? (y/n){Style.RESET_ALL}"
+        ).lower()
+        == "y"
+    )
+    massMentionSize = None
+    if massMention:
+        if (
+            input(
+                f"{Fore.GREEN}{Style.BRIGHT}Do you want a random massmention size? (y/n) {Style.RESET_ALL}"
+            ).lower()
+            == "y"
+        ):
+            minSize = int(
+                input(
+                    f"{Fore.GREEN}{Style.BRIGHT}Enter the minimum amount of people to mention: {Style.RESET_ALL}"
+                )
+            )
+            maxSize = int(
+                input(
+                    f"{Fore.GREEN}{Style.BRIGHT}Enter the maximum amount of people to mention: {Style.RESET_ALL}"
+                )
+            )
+            massMentionSize = (minSize, maxSize)
+        else:
+            massMentionSize = int(
+                input(
+                    f"{Fore.GREEN}{Style.BRIGHT}Enter the ammount of people you want to mention in one message: {Style.RESET_ALL}"
+                )
+            )
+        if (
+            input(
+                f"{Fore.GREEN}{Style.BRIGHT}Do you want to use already scrapped members for massmention? (y/n) {Style.RESET_ALL}"
+            ).lower()
+            != "y"
+        ):
+            # scrape from any channel we can already see/write in
+            scrapeChannel = random.choice(raiders[0]["channels"])
+            await scrapeMassMention(
+                raiders[0]["token"], guildId, scrapeChannel, forceProxy=True
+            )
+
+    await runTasksUntilEnter(
+        [
+            smartRaidWorker(
+                r["token"],
+                r["channels"],
+                contents,
+                massMention,
+                massMentionSize,
+                forceProxy=True,
+            )
+            for r in raiders
+        ]
+    )
+
 
 # SYNC functions
 def clearConsole():
@@ -52,32 +299,22 @@ def clearConsole():
 
 
 def showMenu():
-    print(f"{Style.BRIGHT}{Fore.BLUE}1: Check Tokens {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}2: Join Server {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}3: Server Spammer {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}4: Server Leaver {Style.RESET_ALL}")
-    print(
-        f"{Style.BRIGHT}{Fore.BLUE}5: Format changer: [Email:Pass:Token] -> [Token] {Style.RESET_ALL}"
-    )
-    print(f"{Style.BRIGHT}{Fore.BLUE}6: Single DM Spam {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}7: Mass DM {Style.RESET_ALL}")
-    print(
-        f"{Style.BRIGHT}{Fore.BLUE}8: Username Changer [Email:Pass:Token] {Style.RESET_ALL}"
-    )
-    print(f"{Style.BRIGHT}{Fore.BLUE}9: Bio Changer {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}10: Friends Spammer {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}11: Member scrapper {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}12: VC spammer {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}13: Reaction Spammer {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}14: Global name scrapper {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}15: Avatar scrapper {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}16: Avatar adder {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}17: Fp scrapper {Style.RESET_ALL}")
-    print(
-        f"{Style.BRIGHT}{Fore.BLUE}18: Check if token is in a server {Style.RESET_ALL}"
-    )
-    print(f"{Style.BRIGHT}{Fore.BLUE}19: Change global name {Style.RESET_ALL}")
-    print(f"{Style.BRIGHT}{Fore.BLUE}20: Exit {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}1: Token Tools {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}2: Server Joiner {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}3: Scraping Menu {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}4: Mass DM Menu {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}5: Profile Changer {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}6: Raiding Menu {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.BLUE}7: Adder Menu {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.RED}0: Exit {Style.RESET_ALL}")
+
+
+def showSubMenu(title: str, options: list):
+    """Render a category submenu: a heading, its numbered options and a 0 Back row."""
+    print(f"\n{Style.BRIGHT}{Fore.CYAN}=== {title} ==={Style.RESET_ALL}")
+    for key, label in options:
+        print(f"{Style.BRIGHT}{Fore.BLUE}{key}: {label} {Style.RESET_ALL}")
+    print(f"{Style.BRIGHT}{Fore.RED}0: Back {Style.RESET_ALL}")
 
 
 def changeFormat(token: str):
@@ -99,14 +336,15 @@ def setTitle(tokens: list):
 
 
 # ASYNC FUNCTIONS
-async def scrapeMassMention(token, guildId, channelId):
-    o = await buildMultiTool(token)
+async def scrapeMassMention(token, guildId, channelId, forceProxy: bool = False):
+    o = await buildMultiTool(token, forceProxy)
     res = await o.getGuild(guildId)
     if "name" not in res:
         return await scrapeMassMention(
             random.choice(open("input/tokens.txt").read().splitlines()),
             guildId,
             channelId,
+            forceProxy,
         )
     open("scraped/massmention.txt", "w").write("")
     console.s_print(f"Scraping in {guildId} with {token}")
@@ -313,8 +551,6 @@ async def reactionSpammer(
     delayConfig: Union[dict, None],
 ):
     m = await buildMultiTool(token)
-    if m == None:
-        return None
     if useDelay:
         if delayConfig["random"]:
             await asyncio.sleep(random.uniform(delayConfig["min"], delayConfig["max"]))
@@ -323,32 +559,37 @@ async def reactionSpammer(
     await m.addReactionByEmoji(messageId, channelId, emojiObj)
 
 
-async def buildMultiTool(token: str) -> MultiTool:
+async def buildMultiTool(token: str, forceProxy: bool = False) -> MultiTool:
     try:
         m = MultiTool()
-        await m._init(token)
+        await m._init(token, forceProxy)
         return m
     except Exception as e:
         console.f_print(f"Error while building Multitool Coroutine: {e}")
-        return await buildMultiTool(token)
+        return await buildMultiTool(token, forceProxy)
 
 
 async def checkInServer(token: str, guildId: str):
     m = await buildMultiTool(token)
-    if m is None:
-        return None
     if await m.checkServer(guildId):
         in_server.append(token)
 
 
 async def sendMessage(
-    token: str, channelId: str, message: str, massMention: bool, massMentionSize: int
+    token: str,
+    channelId: str,
+    message: str,
+    massMention: bool,
+    massMentionSize: int,
+    forceProxy: bool = False,
 ):
-    m = await buildMultiTool(token)
-    if m == None:
-        return None
+    m = await buildMultiTool(token, forceProxy)
+    with open("scraped/massmention.txt") as fs:
+        scrappedMembers = fs.readlines()
     while True:
-        await m.sendMessageInChannel(message, channelId, massMention, massMentionSize)
+        await m.sendMessageInChannel(
+            message, channelId, massMention, massMentionSize, scrappedMembers
+        )
 
 
 async def friendRequest(token: str, username: str, discrim: str):
@@ -435,22 +676,14 @@ async def join(
     return res
 
 
-async def menu():
+async def runAction(choice: int, tokens: list):
+    """Execute a single action by its (legacy) number. The menu hierarchy maps every
+    submenu selection to one of these numbers, so the action bodies stay untouched."""
     global duplicates
     global notjoined
     global lockedtokens
     global invalidTokens
     try:
-        tokens = open("input/tokens.txt").read().splitlines()
-        setTitle(tokens)
-        print("")
-        showMenu()
-        print("\n")
-        choice = int(
-            input(
-                f"[>] {Fore.GREEN}{Style.BRIGHT}Enter your choice \n>> {Style.RESET_ALL}"
-            )
-        )
         if choice == 1:
             console.s_print(f"Checking tokens...")
             async with TaskPool(10_000) as pool:
@@ -472,7 +705,7 @@ async def menu():
                 for goodtoken in goodtokens:
                     open("input/tokens.txt", "a").write(f"{goodtoken}\n")
             goodtokens.clear()
-            return await menu()
+            return
         if choice == 2:
             console.s_print(f"Server Joiner...")
             rawInvite = input(
@@ -482,7 +715,7 @@ async def menu():
                 req1 = Utility().getInviteInfo(rawInvite)
                 if req1 == {"message": "Unknown Invite", "code": 10006}:
                     console.f_print(f"https://discord.gg/{rawInvite} is INVALID")
-                    return await menu()
+                    return
             except:
                 console.f_print(
                     "Failed to get invite info, You are probably ratelimited, try using a VPN"
@@ -491,7 +724,7 @@ async def menu():
                 if Utility().config.get("proxy")[
                     "proxyless"
                 ]:  # if proxyless is true, redirect back to `menu` otherwise keep joining
-                    return await menu()
+                    return
             console.s_print(f"https://discord.gg/{rawInvite} is VALID")
             ctx = Utility().getContextProperties(
                 req1["channel"]["id"], req1["guild"]["id"]
@@ -550,7 +783,7 @@ async def menu():
             )
             seen.clear()
             duplicates = 0
-            return await menu()
+            return
         if choice == 3:
             console.s_print(f"Server spammer...")
             massMention = (
@@ -592,7 +825,7 @@ async def menu():
             channelId = input(
                 f"{Fore.GREEN}{Style.BRIGHT}Enter the channel Id you want to spam: {Style.RESET_ALL}"
             )
-            m = await buildMultiTool(random.choice(tokens))
+            m = await buildMultiTool(random.choice(tokens), forceProxy=True)
             guildId = await m.getChannel(channelId)
 
             if (
@@ -602,14 +835,23 @@ async def menu():
                 ).lower()
                 != "y"
             ):
-                await scrapeMassMention(random.choice(tokens), guildId, channelId)
+                await scrapeMassMention(
+                    random.choice(tokens), guildId, channelId, forceProxy=True
+                )
             await runTasksUntilEnter(
                 [
-                    sendMessage(token, channelId, message, massMention, massMentionSize)
+                    sendMessage(
+                        token,
+                        channelId,
+                        message,
+                        massMention,
+                        massMentionSize,
+                        forceProxy=True,
+                    )
                     for token in tokens
                 ]
             )
-            return await menu()
+            return
         if choice == 4:
             console.s_print(f"Server leaver...")
             guildId = input(
@@ -618,14 +860,14 @@ async def menu():
             async with TaskPool(10_000) as pool:
                 for token in tokens:
                     await pool.put(leave(token, guildId))
-            return await menu()
+            return
         if choice == 5:
             console.s_print(f"Format changer...")
             open("input/tokens.txt", "w").write("")
             for token in tokens:
                 token = changeFormat(token)
                 open("input/tokens.txt", "a").write(token + "\n")
-            return await menu()
+            return
         if choice == 6:
             console.s_print(f"Single DM Spammer...")
             message = input(
@@ -637,12 +879,12 @@ async def menu():
             await runTasksUntilEnter(
                 [spamMessages(token, userId, message) for token in tokens]
             )
-            return await menu()
+            return
         if choice == 7:
             console.f_print(
                 f"Hey Multitool user. We are sorry but mass dm is currently disabled"
             )
-            return await menu()
+            return
             console.s_print(f"Mass DM...")
             members = open("scraped/members.txt").read().splitlines()
             if len(members) == 0:
@@ -662,7 +904,7 @@ async def menu():
                             global_variables.getGoodToken(), member, variableReplaced
                         )
                     )
-            return await menu()
+            return
         if choice == 8:
             console.s_print(f"Username changer...")
             usernames = open("input/usernames.txt").read().splitlines()
@@ -671,24 +913,24 @@ async def menu():
                     f"Please input some usernames before using this feature"
                 )
                 input("Press enter to return to menu")
-                return await menu()
+                return
             async with TaskPool(10_000) as pool:
                 for token in tokens:
                     await pool.put(usernameChanger(token, random.choice(usernames)))
-            return await menu()
+            return
         if choice == 9:
             console.s_print(f"Bio changer...")
             bios = open("input/bios.txt").read().splitlines()
             if len(usernames) == 0:
                 console.f_print(f"Please input some bios before using this feature")
                 input("Press enter to return to menu")
-                return await menu()
+                return
             async with TaskPool(10_000) as pool:
                 for token in tokens:
                     await pool.put(bioChanger(token, random.choice(bios)))
-            return await menu()
+            return
         if choice == 10:
-            console.s_print(f"Friend spammer...")
+            console.s_print(f"Friend adder...")
             spllited = input(
                 f"{Fore.GREEN}{Style.BRIGHT}Enter your username and tag: {Style.RESET_ALL}"
             ).split("#")
@@ -697,7 +939,7 @@ async def menu():
             await runTasksUntilEnter(
                 [friendRequest(token, username, discrim) for token in tokens]
             )
-            return await menu()
+            return
         if choice == 11:
             console.s_print("Member scrapper...")
             channelId = input(
@@ -712,7 +954,7 @@ async def menu():
             m = await buildMultiTool(random.choice(tokens))
             guildId = await m.getChannel(channelId)
             await scrapeMembers(random.choice(tokens), guildId, channelId, emptyFirst)
-            return await menu()
+            return
         if choice == 12:
             console.s_print("VC Spammer...")
             channelId = input(
@@ -730,9 +972,9 @@ async def menu():
                 coros.append(vcSpammer(token, guildId, channelId))
             await runTasksUntilEnter(coros)
             seen.clear()
-            return await menu()
+            return
         if choice == 13:
-            console.s_print("Reaction Spammer...")
+            console.s_print("Reaction adder...")
             guildId = input(
                 f"{Fore.GREEN}{Style.BRIGHT}Enter the guild Id: {Style.RESET_ALL}"
             )
@@ -747,7 +989,7 @@ async def menu():
             if not reactions:
                 console.f_print("No reactions found on that message.")
                 input("Press enter to return to menu")
-                return await menu()
+                return
             console.s_print("Reactions on this message:")
             for index, reaction in enumerate(reactions):
                 print(
@@ -761,7 +1003,7 @@ async def menu():
             if selected < 0 or selected >= len(reactions):
                 console.f_print("Invalid reaction selection.")
                 input("Press enter to return to menu")
-                return await menu()
+                return
             emojiObj = reactions[selected]["emoji"]
             useDelay = (
                 input(
@@ -795,15 +1037,14 @@ async def menu():
                         )
                     )
                     delayConfig = {"random": False, "fixed": fixedDelay}
-            await runTasksUntilEnter(
-                [
-                    reactionSpammer(
-                        token, channelId, messageId, emojiObj, useDelay, delayConfig
+            async with TaskPool(10_000) as pool:
+                for token in tokens:
+                    await pool.put(
+                        reactionSpammer(
+                            token, channelId, messageId, emojiObj, useDelay, delayConfig
+                        )
                     )
-                    for token in tokens
-                ]
-            )
-            return await menu()
+            return
         if choice == 14:
             console.s_print("Global name scrapper...")
             channelId = input(
@@ -820,7 +1061,7 @@ async def menu():
             await scrapeGlobalNames(
                 random.choice(tokens), guildId, channelId, emptyFirst
             )
-            return await menu()
+            return
         if choice == 15:
             console.s_print("Avatar scrapper...")
             channelId = input(
@@ -835,17 +1076,17 @@ async def menu():
             m = await buildMultiTool(random.choice(tokens))
             guildId = await m.getChannel(channelId)
             await scrapeAvatars(random.choice(tokens), guildId, channelId, emptyFirst)
-            return await menu()
+            return
         if choice == 16:
             console.s_print("Avatar adder...")
             avatars = loadAvatars()
             if not avatars:
                 input("Press enter to return to menu")
-                return await menu()
+                return
             async with TaskPool(10_000) as pool:
                 for token in tokens:
                     await pool.put(avatarChanger(token, random.choice(avatars)))
-            return await menu()
+            return
         if choice == 17:
             console.s_print("Fp scrapper...")
             scrapper = FpScrapper()
@@ -854,7 +1095,7 @@ async def menu():
             except KeyboardInterrupt:
                 scrapper._stop.set()
                 console.w_print("Stopping fingerprint generator...")
-            return await menu()
+            return
         if choice == 18:
             console.s_print("Check if token is in a server...")
             guildId = input(
@@ -880,7 +1121,7 @@ async def menu():
                     f"Saved {len(in_server)} token(s) to input/tokens_in_server_{guildId}.txt"
                 )
             in_server.clear()
-            return await menu()
+            return
         if choice == 19:
             console.s_print("Change global name...")
             oneForAll = (
@@ -913,23 +1154,139 @@ async def menu():
                         f"{path} is empty. Add global names or scrape them first."
                     )
                     input("Press enter to return to menu")
-                    return await menu()
+                    return
             async with TaskPool(10_000) as pool:
                 for token in tokens:
                     name = staticName if oneForAll else random.choice(globalNames)
                     await pool.put(globalNameChanger(token, name))
-            return await menu()
-        if choice == 20:
-            exit()
-        else:
-            console.f_print("Invalid Choice")
-            return await menu()
-
+            return
+        if choice == 21:
+            await smartRaid(tokens)
+            return
     except Exception as e:
         console.f_print(e)
         if Utility().config["traceback"]:
             print(format_exc())
-        return await menu()
+
+
+async def _runSubMenu(title: str, options: list):
+    """Loop a category submenu until the user picks 0 (Back).
+
+    `options` is a list of (key, label, actionNumber). The key is what the user types,
+    the label is shown, and the actionNumber routes into runAction() — so all the real
+    work still lives in the original action bodies."""
+    while True:
+        tokens = open("input/tokens.txt").read().splitlines()
+        setTitle(tokens)
+        showSubMenu(title, [(key, label) for key, label, _ in options])
+        choice = input(
+            f"\n[>] {Fore.GREEN}{Style.BRIGHT}Enter your choice \n>> {Style.RESET_ALL}"
+        ).strip()
+        if choice == "0":
+            return
+        action = next((num for key, _, num in options if key == choice), None)
+        if action is None:
+            console.f_print("Invalid Choice")
+            continue
+        await runAction(action, tokens)
+
+
+async def tokenToolsMenu():
+    await _runSubMenu(
+        "Token Tools",
+        [
+            ("1", "Check Tokens", 1),
+            ("2", "Format changer: [Email:Pass:Token] -> [Token]", 5),
+            ("3", "Check if token is in a server", 18),
+        ],
+    )
+
+
+async def scrapingMenu():
+    await _runSubMenu(
+        "Scraping Menu",
+        [
+            ("1", "Member scrapper", 11),
+            ("2", "Global name scrapper", 14),
+            ("3", "Avatar scrapper", 15),
+            ("4", "Fp scrapper", 17),
+        ],
+    )
+
+
+async def massDmMenu():
+    await _runSubMenu(
+        "Mass DM Menu",
+        [
+            ("1", "Mass DM", 7),
+            ("2", "Single DM Spam", 6),
+        ],
+    )
+
+
+async def profileMenu():
+    await _runSubMenu(
+        "Profile Changer",
+        [
+            ("1", "Change global name", 19),
+            ("2", "Username Changer [Email:Pass:Token]", 8),
+            ("3", "Bio Changer", 9),
+            ("4", "Avatar adder", 16),
+        ],
+    )
+
+
+async def raidingMenu():
+    await _runSubMenu(
+        "Raiding Menu",
+        [
+            ("1", "Server Spammer", 3),
+            ("2", "VC spammer", 12),
+            ("3", "Server Leaver", 4),
+            ("4", "Smart Raid", 21),
+        ],
+    )
+
+
+async def adderMenu():
+    await _runSubMenu(
+        "Adder Menu",
+        [
+            ("1", "Reaction adder", 13),
+            ("2", "Friend adder", 10),
+        ],
+    )
+
+
+async def menu():
+    """Top-level menu: route to a category submenu, or run the joiner directly."""
+    while True:
+        tokens = open("input/tokens.txt").read().splitlines()
+        setTitle(tokens)
+        print("")
+        showMenu()
+        print("\n")
+        choice = input(
+            f"[>] {Fore.GREEN}{Style.BRIGHT}Enter your choice \n>> {Style.RESET_ALL}"
+        ).strip()
+        if choice == "1":
+            await tokenToolsMenu()
+        elif choice == "2":
+            await runAction(2, open("input/tokens.txt").read().splitlines())
+        elif choice == "3":
+            await scrapingMenu()
+        elif choice == "4":
+            await massDmMenu()
+        elif choice == "5":
+            await profileMenu()
+        elif choice == "6":
+            await raidingMenu()
+        elif choice == "7":
+            await adderMenu()
+        elif choice == "0":
+            exit()
+        else:
+            console.f_print("Invalid Choice")
 
 
 if __name__ == "__main__":
